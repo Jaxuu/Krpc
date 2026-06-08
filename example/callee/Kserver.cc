@@ -53,7 +53,8 @@ int main(int argc, char **argv) {
     KrpcProvider provider;
 
     // 将 UserService 对象发布到 RPC 节点上，使其可以被远程调用
-    provider.NotifyService(new UserService());
+    UserService my_service;
+    provider.NotifyService(&my_service);
 
     // 启动 RPC 服务节点，进入阻塞状态，等待远程的 RPC 调用请求
     provider.Run();

@@ -34,7 +34,6 @@
 ```
 KRpc-Cpp/
 ├── CMakeLists.txt                  # 根 CMake 构建脚本
-├── LICENSE                         # GPL v3 许可证
 ├── README.md                       # 项目说明（本文件）
 │
 ├── src/                            # 核心框架源码

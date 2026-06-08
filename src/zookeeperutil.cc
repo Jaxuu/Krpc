@@ -1,32 +1,35 @@
 #include "zookeeperutil.h"
 #include "Krpcapplication.h"
-#include <mutex>
 #include "KrpcLogger.h"
-#include <condition_variable>
 
-std::mutex cv_mutex;        // 全局锁，用于保护共享变量的线程安全
-std::condition_variable cv; // 条件变量，用于线程间通信
-bool is_connected = false;  // 标记ZooKeeper客户端是否连接成功
+
 
 // 全局的watcher观察器，用于接收ZooKeeper服务器的通知
 void global_watcher(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx) {
-    if (type == ZOO_SESSION_EVENT) {  // 回调消息类型和会话相关的事件
-        if (status == ZOO_CONNECTED_STATE) {  // ZooKeeper客户端和服务器连接成功
-            std::lock_guard<std::mutex> lock(cv_mutex);  // 加锁保护
-            is_connected = true;  // 标记连接成功
+    if (type == ZOO_SESSION_EVENT) {  
+        if (status == ZOO_CONNECTED_STATE) {  
+            // 将 void* 强转回 ZkClient* 指针
+            ZkClient *client = static_cast<ZkClient*>(watcherCtx);
+            if (client != nullptr) {
+                client->NotifyConnected(); // 精准唤醒触发回调的那个对象
+            }
         }
     }
-    cv.notify_all();  // 通知所有等待的线程
 }
 
-// 构造函数，初始化ZooKeeper客户端句柄为空
-ZkClient::ZkClient() : m_zhandle(nullptr) {}
+ZkClient::ZkClient() : m_zhandle(nullptr), m_connected(false) {}
 
-// 析构函数，关闭ZooKeeper连接
 ZkClient::~ZkClient() {
     if (m_zhandle != nullptr) {
         zookeeper_close(m_zhandle);  // 关闭ZooKeeper连接
     }
+}
+
+// 唤醒当前对象
+void ZkClient::NotifyConnected() {
+    std::lock_guard<std::mutex> lock(m_mutex);  
+    m_connected = true;  
+    m_cv.notify_all();  
 }
 
 // 启动ZooKeeper客户端，连接ZooKeeper服务器
@@ -45,16 +48,19 @@ void ZkClient::Start() {
     */
 
     // 使用zookeeper_init初始化一个ZooKeeper客户端对象，异步建立与服务器的连接
-    m_zhandle = zookeeper_init(connstr.c_str(), global_watcher, 6000, nullptr, nullptr, 0);
+    m_zhandle = zookeeper_init(connstr.c_str(), global_watcher, 6000, nullptr, this, 0);
     if (nullptr == m_zhandle) {  // 初始化失败
         LOG(ERROR) << "zookeeper_init error";
         exit(EXIT_FAILURE);  // 退出程序
     }
 
     // 等待连接成功
-    std::unique_lock<std::mutex> lock(cv_mutex);
-    cv.wait(lock, [] { return is_connected; });  // 阻塞等待，直到连接成功
-    LOG(INFO) << "zookeeper_init success";  // 记录日志，表示连接成功
+    std::unique_lock<std::mutex> lock(m_mutex);
+    // 【规范】设置 10 秒超时。如果 10 秒连不上，直接报错退出，避免进程僵死
+    if (!m_cv.wait_for(lock, std::chrono::seconds(10), [this] { return m_connected; })) {
+        LOG(FATAL) << "ZooKeeper 连接超时 (10秒)! 请检查 IP 和端口是否正确。";
+    }
+    LOG(INFO) << "zookeeper_init success";
 }
 
 // 创建ZooKeeper节点

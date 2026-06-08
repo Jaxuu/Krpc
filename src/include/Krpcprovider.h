@@ -30,13 +30,8 @@ private:
     
     void OnConnection(const muduo::net::TcpConnectionPtr& conn);
     void OnMessage(const muduo::net::TcpConnectionPtr& conn, muduo::net::Buffer* buffer, muduo::Timestamp receive_time);
-    void SendRpcResponse(const muduo::net::TcpConnectionPtr& conn, google::protobuf::Message* response);
+    void SendRpcResponse(const muduo::net::TcpConnectionPtr& conn, google::protobuf::Message* response, uint64_t request_id);
 };
 #endif 
-
-
-
-
-
 
 

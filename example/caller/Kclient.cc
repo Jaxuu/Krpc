@@ -5,78 +5,80 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <vector>
+#include <algorithm>
 #include "KrpcLogger.h"
 
-// 发送 RPC 请求的函数，模拟客户端调用远程服务
-void send_request(int thread_id, std::atomic<int> &success_count, std::atomic<int> &fail_count,int requests_per_thread) {
-    // 创建一个 UserServiceRpc_Stub 对象，用于调用远程的 RPC 方法
-    Kuser::UserServiceRpc_Stub stub(new KrpcChannel(false));
-
-    // 设置 RPC 方法的请求参数
+// 压测函数
+void send_request(Kuser::UserServiceRpc_Stub* stub, int requests_per_thread, std::vector<double>& local_latencies) {
     Kuser::LoginRequest request;
-    request.set_name("zhangsan");  // 设置用户名
-    request.set_pwd("123456");    // 设置密码
-
-    // 定义 RPC 方法的响应参数
+    request.set_name("benchmark_user");  
+    request.set_pwd("123456");    
     Kuser::LoginResponse response;
-    Krpccontroller controller;  // 创建控制器对象，用于处理 RPC 调用过程中的错误
-    for (int i = 0; i < requests_per_thread; ++i) {
-        // 调用远程的 Login 方法
-        stub.Login(&controller, &request, &response, nullptr);
 
-        // 检查 RPC 调用是否成功
-        if (controller.Failed()) {  // 如果调用失败
-            std::cout << controller.ErrorText() << std::endl;  // 打印错误信息
-            fail_count++;  // 失败计数加 1
-        } else {  // 如果调用成功
-            if (int{} == response.result().errcode()) {  // 检查响应中的错误码
-                std::cout << "rpc login response success:" << response.success() << std::endl;  // 打印成功信息
-                success_count++;  // 成功计数加 1
-            } else {  // 如果响应中有错误
-                std::cout << "rpc login response error : " << response.result().errmsg() << std::endl;  // 打印错误信息
-                fail_count++;  // 失败计数加 1
-            }
-        }
+    for (int i = 0; i < requests_per_thread; ++i) {
+        Krpccontroller controller;
+        auto req_start = std::chrono::high_resolution_clock::now();
+        
+        // 发起 RPC 调用
+        stub->Login(&controller, &request, &response, nullptr);
+
+        auto req_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> req_elapsed = req_end - req_start;
+        local_latencies.push_back(req_elapsed.count()); 
     }
 }
 
 int main(int argc, char **argv) {
-    // 初始化 RPC 框架，解析命令行参数并加载配置文件
     KrpcApplication::Init(argc, argv);
 
-    // 创建日志对象
-    KrpcLogger logger("MyRPC");
+    // 压测参数
+    const int thread_count = 100;      
+    const int requests_per_thread = 5000; 
 
-const int thread_count = 100;      // 线程数改为 100
-const int requests_per_thread = 5000; // 每个线程发 5000 次请求
+    // 共享 Channel，测试多路复用
+    KrpcChannel* channel = new KrpcChannel(false); 
+    Kuser::UserServiceRpc_Stub stub(channel);
 
-    std::vector<std::thread> threads;  // 存储线程对象的容器
-    std::atomic<int> success_count(0); // 成功请求的计数器
-    std::atomic<int> fail_count(0);    // 失败请求的计数器
+    std::vector<std::thread> threads;  
+    std::vector<std::vector<double>> all_latencies(thread_count);
+    for(int i=0; i<thread_count; ++i) {
+        all_latencies[i].reserve(requests_per_thread);
+    }
 
-    auto start_time = std::chrono::high_resolution_clock::now();  // 记录测试开始时间
+    LOG(INFO) << "Starting Benchmark...";
+    auto start_time = std::chrono::high_resolution_clock::now();  
 
-    // 启动多线程进行并发测试
     for (int i = 0; i < thread_count; i++) {
-        threads.emplace_back([argc, argv, i, &success_count, &fail_count, requests_per_thread]() {  
-                send_request(i, success_count, fail_count,requests_per_thread);  // 每个线程发送指定数量的请求
+        threads.emplace_back([&stub, requests_per_thread, &all_latencies, i]() {  
+            send_request(&stub, requests_per_thread, all_latencies[i]);  
         });
     }
 
-    // 等待所有线程执行完毕
-    for (auto &t : threads) {
-        t.join();
+    for (auto &t : threads) { t.join(); }
+    // 【添加这行】确保程序真的执行到了这里
+    LOG(INFO) << "All threads finished! Calculating results...";
+    
+    auto end_time = std::chrono::high_resolution_clock::now();  
+    std::chrono::duration<double> total_elapsed = end_time - start_time;  
+
+    // 合并并计算 P99
+    std::vector<double> merged_latencies;
+    merged_latencies.reserve(thread_count * requests_per_thread);
+    for (const auto& local_lat : all_latencies) {
+        merged_latencies.insert(merged_latencies.end(), local_lat.begin(), local_lat.end());
     }
+    std::sort(merged_latencies.begin(), merged_latencies.end());
+    
+    double p99_latency = merged_latencies[merged_latencies.size() * 0.99];
+    double qps = (thread_count * requests_per_thread) / total_elapsed.count();
 
-    auto end_time = std::chrono::high_resolution_clock::now();  // 记录测试结束时间
-    std::chrono::duration<double> elapsed = end_time - start_time;  // 计算测试耗时
-
-    // 输出统计结果
-    LOG(INFO) << "Total requests: " << thread_count * requests_per_thread;  // 总请求数
-    LOG(INFO) << "Success count: " << success_count;  // 成功请求数
-    LOG(INFO) << "Fail count: " << fail_count;  // 失败请求数
-    LOG(INFO) << "Elapsed time: " << elapsed.count() << " seconds";  // 测试耗时
-    LOG(INFO) << "QPS: " << (thread_count * requests_per_thread) / elapsed.count();  // 计算 QPS（每秒请求数）
+    // 极限精简输出
+    LOG(INFO) << "========= Benchmark Results =========";
+    LOG(INFO) << "Total Requests : " << thread_count * requests_per_thread;
+    LOG(INFO) << "QPS            : " << qps << " req/sec";
+    LOG(INFO) << "P99 Latency    : " << p99_latency << " ms";
+    LOG(INFO) << "=====================================";
 
     return 0;
 }

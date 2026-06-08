@@ -1,18 +1,25 @@
 #ifndef _Krpcchannel_h_
 #define _Krpcchannel_h_
-// 此类是继承自google::protobuf::RpcChannel
-// 目的是为了给客户端进行方法调用的时候，统一接收的
 #include <google/protobuf/service.h>
-#include "zookeeperutil.h"
+#include <string>
+#include <cstdint>
+#include <future>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
+#include <sys/types.h> // 提供 ssize_t 定义
+
+class ZkClient;
+
 class KrpcChannel : public google::protobuf::RpcChannel
 {
 public:
     KrpcChannel(bool connectNow);
     virtual ~KrpcChannel()
     {
-          if (m_clientfd >= 0) {
-        close(m_clientfd);
-    }  
+        if (m_clientfd >= 0) {
+            close(m_clientfd);
+        }
     }
     void CallMethod(const ::google::protobuf::MethodDescriptor *method,
                     ::google::protobuf::RpcController *controller,
@@ -26,9 +33,19 @@ private:
     uint16_t m_port;
     std::string method_name;
     int m_idx; // 用来划分服务器ip和port的下标
+
     bool newConnect(const char *ip, uint16_t port);
     std::string QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx);
-       // 新增：确保读取指定长度的数据，解决TCP拆包
     ssize_t recv_exact(int fd, char* buf, size_t size);
+
+    // 新增多路复用核心成员
+    std::atomic<uint64_t> m_request_id_generator{0};  
+    std::mutex m_promise_mutex;                       
+    std::unordered_map<uint64_t, std::promise<std::string>> m_pending_requests; 
+    
+    std::mutex m_send_mutex; // 保护 Socket 发送
+    std::mutex m_conn_mutex; // 保护建连过程，防止多线程并发建连
+
+    void ReadTask(); // 后台接收线程
 };
 #endif

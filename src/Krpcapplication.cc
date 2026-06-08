@@ -40,12 +40,8 @@ void KrpcApplication::Init(int argc, char **argv) {
 
 // 获取单例对象的引用，保证全局只有一个实例
 KrpcApplication &KrpcApplication::GetInstance() {
-    std::lock_guard<std::mutex> lock(m_mutex);  // 加锁，保证线程安全
-    if (m_application == nullptr) {  // 如果单例对象还未创建
-        m_application = new KrpcApplication();  // 创建单例对象
-        atexit(deleteInstance);  // 注册atexit函数，程序退出时自动销毁单例对象
-    }
-    return *m_application;  // 返回单例对象的引用
+    static KrpcApplication instance; 
+    return instance;
 }
 
 // 程序退出时自动调用的函数，用于销毁单例对象
