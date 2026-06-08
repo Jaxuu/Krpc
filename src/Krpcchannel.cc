@@ -11,31 +11,30 @@
 #include "KrpcLogger.h"
 
 // 新增后台独立接收线程，解析响应并精准唤醒对应的业务线程
-void KrpcChannel::ReadTask() {
+void KrpcChannel::ReadTask(int fd) {
     while (true) {
         uint32_t total_len = 0;
-        if (recv_exact(m_clientfd, (char*)&total_len, 4) != 4) break; 
+        if (recv_exact(fd, (char*)&total_len, 4) != 4) break; // 这里使用传入的 fd
         total_len = ntohl(total_len);
 
         uint32_t header_len = 0;
-        if (recv_exact(m_clientfd, (char*)&header_len, 4) != 4) break;
+        if (recv_exact(fd, (char*)&header_len, 4) != 4) break;
         header_len = ntohl(header_len);
 
         std::vector<char> header_buf(header_len);
-        if (recv_exact(m_clientfd, header_buf.data(), header_len) != header_len) break;
+        if (recv_exact(fd, header_buf.data(), header_len) != header_len) break;
         std::string rpc_header_str(header_buf.data(), header_len);
         Krpc::RpcHeader krpcheader;
         krpcheader.ParseFromString(rpc_header_str);
 
         uint32_t body_len = total_len - 4 - header_len;
         std::vector<char> body_buf(body_len);
-        if (recv_exact(m_clientfd, body_buf.data(), body_len) != body_len) break;
+        if (recv_exact(fd, body_buf.data(), body_len) != body_len) break;
         std::string response_str(body_buf.data(), body_len);
 
         uint64_t req_id = krpcheader.request_id();
         std::lock_guard<std::mutex> lock(m_promise_mutex);
         auto it = m_pending_requests.find(req_id);
-        // 唤醒promise对应的future
         if (it != m_pending_requests.end()) {
             it->second.set_value(response_str); 
             m_pending_requests.erase(it);       
@@ -65,10 +64,10 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
                              ::google::protobuf::Message *response,
                              ::google::protobuf::Closure *done)
 {
-    // 修改：加入双重检查锁，防止 100 个并发线程同时发起连接
-    if (-1 == m_clientfd) {  
+    // 1. 双检锁初始化整个连接池
+    if (!m_is_pool_inited) {  
         std::lock_guard<std::mutex> lock(m_conn_mutex);
-        if (-1 == m_clientfd) {
+        if (!m_is_pool_inited) {
             const google::protobuf::ServiceDescriptor *sd = method->service();
             service_name = sd->name();  
             method_name = method->name();  
@@ -79,15 +78,32 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
             m_ip = host_data.substr(0, m_idx);  
             m_port = atoi(host_data.substr(m_idx + 1, host_data.size() - m_idx).c_str());  
 
-            auto rt = newConnect(m_ip.c_str(), m_port);
-            if (!rt) {
-                controller->SetFailed("connect server error");
-                LOG(ERROR) << "connect server error";  
+            // 为池中的 4 条连接全部建连
+            for (int i = 0; i < m_pool_size; ++i) {
+                if (!connect_node(m_conn_pool[i].get(), m_ip.c_str(), m_port)) {
+                    LOG(ERROR) << "init connection pool failed for node " << i;
+                }
+            }
+            m_is_pool_inited = true; // 标记池初始化完成
+        }
+    }
+
+    // 2. 轮询（Round-Robin）选择一条连接
+    uint32_t idx = m_pool_idx.fetch_add(1) % m_pool_size;
+    ConnectionContext* ctx = m_conn_pool[idx].get();
+
+    // 容错机制：如果选中的连接断开了，尝试重连
+    if (!ctx->is_connected) {
+        std::lock_guard<std::mutex> lock(ctx->send_mutex);
+        if (!ctx->is_connected) {
+            if (!connect_node(ctx, m_ip.c_str(), m_port)) {
+                controller->SetFailed("selected connection is offline and reconnect failed");
                 return;
             }
         }
     }
 
+    // 3. 序列化请求头与包体
     std::string args_str;
     if (!request->SerializeToString(&args_str)) {
         controller->SetFailed("serialize request fail");
@@ -120,6 +136,7 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     send_rpc_str.append(rpc_header_str);
     send_rpc_str.append(args_str);
 
+    // 4. 在全局表中注册 promise
     std::promise<std::string> prom;
     std::future<std::string> fut = prom.get_future();
     {
@@ -127,14 +144,13 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
         m_pending_requests[current_id] = std::move(prom);
     }
 
-    // 发送必须加锁，保护底层的 Socket
+    // 5. 发送数据：使用专属连接的 send_mutex 和 fd！并发度大幅提升
     {
-        std::lock_guard<std::mutex> lock(m_send_mutex);
-        if (-1 == send(m_clientfd, send_rpc_str.c_str(), send_rpc_str.size(), 0)) {
-            // 关闭失效的 socket 描述符，防止 FD 泄漏
-            close(m_clientfd);
-            // 重置为 -1，触发下一个线程执行DCL(双检锁)
-            m_clientfd = -1;
+        std::lock_guard<std::mutex> lock(ctx->send_mutex);
+        if (-1 == send(ctx->fd, send_rpc_str.c_str(), send_rpc_str.size(), 0)) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            ctx->is_connected = false; // 标记断开，下次用到会重连
             controller->SetFailed("send error");
             std::lock_guard<std::mutex> plock(m_promise_mutex);
             m_pending_requests.erase(current_id);
@@ -142,7 +158,7 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
         }
     }
 
-    // 阻塞等待后台读线程通过 set_value 唤醒，最多等3秒
+    // 6. 等待各自专属的 ReadTask 唤醒
     if (fut.wait_for(std::chrono::seconds(3)) == std::future_status::timeout) {
         controller->SetFailed("rpc call timeout");
         std::lock_guard<std::mutex> lock(m_promise_mutex);
@@ -158,36 +174,30 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     }
 }
 
-// 创建新的socket连接
-bool KrpcChannel::newConnect(const char *ip, uint16_t port) {
-    // 创建socket
+// 创建并初始化特定上下文的 socket 连接
+bool KrpcChannel::connect_node(ConnectionContext* ctx, const char *ip, uint16_t port) {
     int clientfd = socket(AF_INET, SOCK_STREAM, 0);
     if (-1 == clientfd) {
-        char errtxt[512] = {0};
-        std::cout << "socket error" << strerror_r(errno, errtxt, sizeof(errtxt)) << std::endl;  // 打印错误信息
-        LOG(ERROR) << "socket error:" << errtxt;  // 记录错误日志
+        LOG(ERROR) << "socket error";  
         return false;
     }
 
-    // 设置服务器地址信息
     struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;  // IPv4地址族
-    server_addr.sin_port = htons(port);  // 端口号
-    server_addr.sin_addr.s_addr = inet_addr(ip);  // IP地址
+    server_addr.sin_family = AF_INET;  
+    server_addr.sin_port = htons(port);  
+    server_addr.sin_addr.s_addr = inet_addr(ip);  
 
-    // 尝试连接服务器
     if (-1 == connect(clientfd, (struct sockaddr *)&server_addr, sizeof(server_addr))) {
-        close(clientfd);  // 连接失败，关闭socket
-        char errtxt[512] = {0};
-        std::cout << "connect error" << strerror_r(errno, errtxt, sizeof(errtxt)) << std::endl;  // 打印错误信息
-        LOG(ERROR) << "connect server error" << errtxt;  // 记录错误日志
+        close(clientfd);  
+        LOG(ERROR) << "connect server error";  
         return false;
     }
 
-    m_clientfd = clientfd;
+    ctx->fd = clientfd;
+    ctx->is_connected = true;
 
-    // 建连成功后，启动后台收包线程
-    std::thread read_thread(&KrpcChannel::ReadTask, this);
+    // 建连成功后，启动专属收包线程，并传入该连接的 fd
+    std::thread read_thread(&KrpcChannel::ReadTask, this, clientfd);
     read_thread.detach(); 
 
     return true;
@@ -196,7 +206,6 @@ bool KrpcChannel::newConnect(const char *ip, uint16_t port) {
 // 从ZooKeeper查询服务地址
 std::string KrpcChannel::QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx) {
     std::string method_path = "/" + service_name + "/" + method_name;  // 构造ZooKeeper路径
-
     std::string host_data_1 = zkclient->GetData(method_path.c_str());  // 从ZooKeeper获取数据
 
     if (host_data_1 == "") {  // 如果未找到服务地址
@@ -214,15 +223,19 @@ std::string KrpcChannel::QueryServiceHost(ZkClient *zkclient, std::string servic
 }
 
 
-// 构造函数，支持延迟连接
-KrpcChannel::KrpcChannel(bool connectNow) : m_clientfd(-1), m_idx(0) {
-    if (!connectNow) return;
-
-    // 尝试连接服务器，最多重试3次
-    auto rt = newConnect(m_ip.c_str(), m_port);
-    int count = 3;  // 重试次数
-    while (!rt && count--) {
-        rt = newConnect(m_ip.c_str(), m_port);
+// 构造函数，支持延迟连接,
+KrpcChannel::KrpcChannel(bool connectNow) : m_idx(0) {
+    for (int i = 0; i < m_pool_size; ++i) {
+        m_conn_pool.push_back(std::unique_ptr<ConnectionContext>(new ConnectionContext()));
     }
+}
 
+// 析构函数：安全释放连接池中的所有 fd
+KrpcChannel::~KrpcChannel() {
+    for (auto& ctx : m_conn_pool) {
+        if (ctx->fd >= 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+        }
+    }
 }

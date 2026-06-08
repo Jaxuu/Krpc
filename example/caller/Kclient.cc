@@ -23,6 +23,16 @@ void send_request(Kuser::UserServiceRpc_Stub* stub, int requests_per_thread, std
         // 发起 RPC 调用
         stub->Login(&controller, &request, &response, nullptr);
 
+        // 新增验证逻辑：如果调用失败，直接退出或跳过，千万别算进成功耗时里！
+        if (controller.Failed()) {
+            // 只打印一次错误，防止日志刷屏卡死终端
+            if (i == 0) { 
+                LOG(ERROR) << "RPC Call Failed! Reason: " << controller.ErrorText();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 失败后稍微让出CPU，避免疯狂重试
+            continue; 
+        }
+
         auto req_end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> req_elapsed = req_end - req_start;
         local_latencies.push_back(req_elapsed.count()); 

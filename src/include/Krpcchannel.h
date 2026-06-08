@@ -7,7 +7,16 @@
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
+#include <vector>
+#include <memory>
 #include <sys/types.h> // 提供 ssize_t 定义
+
+// 每条TCP连接的独立上下文
+struct ConnectionContext {
+    int fd = -1;
+    std::mutex send_mutex; // 每条连接专属的发送锁！
+    std::atomic<bool> is_connected{false}; // 标记当前连接是否存活
+};
 
 class ZkClient;
 
@@ -15,37 +24,36 @@ class KrpcChannel : public google::protobuf::RpcChannel
 {
 public:
     KrpcChannel(bool connectNow);
-    virtual ~KrpcChannel()
-    {
-        if (m_clientfd >= 0) {
-            close(m_clientfd);
-        }
-    }
+    virtual ~KrpcChannel();
     void CallMethod(const ::google::protobuf::MethodDescriptor *method,
                     ::google::protobuf::RpcController *controller,
                     const ::google::protobuf::Message *request,
                     ::google::protobuf::Message *response,
                     ::google::protobuf::Closure *done) override; // override可以验证是否是虚函数
 private:
-    int m_clientfd; // 存放客户端套接字
     std::string service_name;
     std::string m_ip;
     uint16_t m_port;
     std::string method_name;
     int m_idx; // 用来划分服务器ip和port的下标
 
-    bool newConnect(const char *ip, uint16_t port);
+    bool connect_node(ConnectionContext* ctx, const char *ip, uint16_t port);
     std::string QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx);
     ssize_t recv_exact(int fd, char* buf, size_t size);
 
-    // 新增多路复用核心成员
+    // 连接池核心组件
+    const int m_pool_size = 4; // 工业界通常设为 4 或 8，不宜过大
+    std::vector<std::unique_ptr<ConnectionContext>> m_conn_pool;
+    std::atomic<uint32_t> m_pool_idx{0}; // 用于 Round-Robin 轮询的计数器
+
+    std::mutex m_conn_mutex; // 保护建连过程
+    std::atomic<bool> m_is_pool_inited{false}; // 标记连接池是否已完成初始化
+
+    // 多路复用核心组件
     std::atomic<uint64_t> m_request_id_generator{0};  
     std::mutex m_promise_mutex;                       
     std::unordered_map<uint64_t, std::promise<std::string>> m_pending_requests; 
     
-    std::mutex m_send_mutex; // 保护 Socket 发送
-    std::mutex m_conn_mutex; // 保护建连过程，防止多线程并发建连
-
-    void ReadTask(); // 后台接收线程
+    void ReadTask(int fd); // 后台接收线程
 };
 #endif
