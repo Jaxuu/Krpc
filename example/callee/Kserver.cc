@@ -1,62 +1,124 @@
 #include <iostream>
 #include <string>
+#include <unordered_map>
+#include <mutex>
 #include "../user.pb.h"
 #include "Krpcapplication.h"
 #include "Krpcprovider.h"
 
 /*
-UserService 原本是一个本地服务，提供了两个本地方法：Login 和 GetFriendLists。
-现在通过 RPC 框架，这些方法可以被远程调用。
+UserService 提供了真实的本地业务逻辑。
+现在加入了 std::unordered_map 模拟数据库，并加入互斥锁保证高并发安全。
 */
-class UserService : public Kuser::UserServiceRpc // 继承自 protobuf 生成的 RPC 服务基类
+class UserService : public Kuser::UserServiceRpc 
 {
+private:
+    std::unordered_map<std::string, std::string> m_user_db; // 模拟数据库，存储用户名和密码
+    std::mutex m_db_mutex; // 保护数据库的互斥锁
+
 public:
-    // 本地登录方法，用于处理实际的业务逻辑
-    bool Login(std::string name, std::string pwd) {
-        std::cout << "doing local service: Login" << std::endl;
-        std::cout << "name:" << name << " pwd:" << pwd << std::endl;  
-        return true;  // 模拟登录成功
+    // ================= 本地业务逻辑 =================
+
+    // 1. 本地注册方法
+    bool Register(std::string name, std::string pwd, std::string& err_msg) {
+        std::lock_guard<std::mutex> lock(m_db_mutex);
+        // 检测如果注册过，就返回失败
+        if (m_user_db.find(name) != m_user_db.end()) {
+            err_msg = "Register Failed: User '" + name + "' already exists!";
+            std::cout << err_msg << std::endl;
+            return false;
+        }
+        // 没有注册过，添加入库
+        m_user_db[name] = pwd;
+        std::cout << "doing local service: Register Success! User: " << name << std::endl;
+        return true;
     }
 
-    /*
-    重写基类 UserServiceRpc 的虚函数，这些方法会被 RPC 框架直接调用。
-    1. 调用者（caller）通过 RPC 框架发送 Login 请求。
-    2. 服务提供者（callee）接收到请求后，调用下面重写的 Login 方法。
-    */
-    void Login(::google::protobuf::RpcController* controller,
-              const ::Kuser::LoginRequest* request,
-              ::Kuser::LoginResponse* response,
-              ::google::protobuf::Closure* done) {
-        // 从请求中获取用户名和密码
+    // 2. 本地登录方法
+    bool Login(std::string name, std::string pwd, std::string& err_msg) {
+        std::lock_guard<std::mutex> lock(m_db_mutex);
+        auto it = m_user_db.find(name);
+        // 检测如果没有注册，提示先注册
+        if (it == m_user_db.end()) {
+            err_msg = "Login Failed: User '" + name + "' not found, please register first!";
+            std::cout << err_msg << std::endl;
+            return false;
+        }
+        // 检测密码是否正确
+        if (it->second != pwd) {
+            err_msg = "Login Failed: Incorrect password for user '" + name + "'!";
+            std::cout << err_msg << std::endl;
+            return false;
+        }
+        std::cout << "doing local service: Login Success! User: " << name << std::endl;  
+        return true;  
+    }
+
+    // ================= RPC 接口实现 =================
+
+    // 重写 Register RPC 方法
+    void Register(::google::protobuf::RpcController* controller,
+                  const ::Kuser::RegisterRequest* request,
+                  ::Kuser::RegisterResponse* response,
+                  ::google::protobuf::Closure* done) override {
         std::string name = request->name();
         std::string pwd = request->pwd();
+        std::string err_msg;
 
-        // 调用本地业务逻辑处理登录
-        bool login_result = Login(name, pwd); 
+        // 调用本地业务逻辑
+        bool register_result = Register(name, pwd, err_msg); 
 
-        // 将响应结果写入 response 对象
+        // 组装响应
         Kuser::ResultCode *code = response->mutable_result();
-        code->set_errcode(0);  // 设置错误码为 0，表示成功
-        code->set_errmsg("");  // 设置错误信息为空
-        response->set_success(login_result);  // 设置登录结果
+        if (register_result) {
+            code->set_errcode(0);
+            code->set_errmsg("");
+        } else {
+            code->set_errcode(1);  // 自定义错误码 1 表示业务失败
+            code->set_errmsg(err_msg);
+        }
+        response->set_success(register_result);
 
-        // 执行回调操作，框架会自动将响应序列化并发送给调用者
+        // 回调，通知框架发包
+        done->Run();
+    }
+
+    // 重写 Login RPC 方法
+    void Login(::google::protobuf::RpcController* controller,
+               const ::Kuser::LoginRequest* request,
+               ::Kuser::LoginResponse* response,
+               ::google::protobuf::Closure* done) override {
+        std::string name = request->name();
+        std::string pwd = request->pwd();
+        std::string err_msg;
+
+        // 调用本地业务逻辑
+        bool login_result = Login(name, pwd, err_msg); 
+
+        // 组装响应
+        Kuser::ResultCode *code = response->mutable_result();
+        if (login_result) {
+            code->set_errcode(0);
+            code->set_errmsg("");
+        } else {
+            code->set_errcode(1);
+            code->set_errmsg(err_msg);
+        }
+        response->set_success(login_result);
+
+        // 回调，通知框架发包
         done->Run();
     }
 };
 
 int main(int argc, char **argv) {
-    // 调用框架的初始化操作，解析命令行参数并加载配置文件
     KrpcApplication::Init(argc, argv);
 
-    // 创建一个 RPC 服务提供者对象
     KrpcProvider provider;
 
-    // 将 UserService 对象发布到 RPC 节点上，使其可以被远程调用
     UserService my_service;
     provider.NotifyService(&my_service);
 
-    // 启动 RPC 服务节点，进入阻塞状态，等待远程的 RPC 调用请求
     provider.Run();
 
     return 0;

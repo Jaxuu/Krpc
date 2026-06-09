@@ -9,27 +9,43 @@
 #include <algorithm>
 #include "KrpcLogger.h"
 
-// 压测函数
+// 压测函数：交替测试 Login 和 Register
 void send_request(Kuser::UserServiceRpc_Stub* stub, int requests_per_thread, std::vector<double>& local_latencies) {
-    Kuser::LoginRequest request;
-    request.set_name("benchmark_user");  
-    request.set_pwd("123456");    
-    Kuser::LoginResponse response;
+    // 1. 构造 Login 请求
+    Kuser::LoginRequest login_request;
+    login_request.set_name("benchmark_user");  
+    login_request.set_pwd("123456");    
+    Kuser::LoginResponse login_response;
+
+    // 2. 构造 Register 请求 
+    // (如果你的 RegisterRequest 有不同的字段，请在这里按需修改)
+    Kuser::RegisterRequest register_request;
+    register_request.set_name("benchmark_new_user");
+    register_request.set_pwd("654321");
+    // register_request.set_id(1001); 
+    Kuser::RegisterResponse register_response;
 
     for (int i = 0; i < requests_per_thread; ++i) {
         Krpccontroller controller;
         auto req_start = std::chrono::high_resolution_clock::now();
         
-        // 发起 RPC 调用
-        stub->Login(&controller, &request, &response, nullptr);
+        // 核心测试点：单数发 Login，双数发 Register
+        bool is_login = (i % 2 == 0);
+        
+        if (is_login) {
+            stub->Login(&controller, &login_request, &login_response, nullptr);
+        } else {
+            stub->Register(&controller, &register_request, &register_response, nullptr);
+        }
 
-        // 新增验证逻辑：如果调用失败，直接退出或跳过，千万别算进成功耗时里！
+        // 失败拦截
         if (controller.Failed()) {
-            // 只打印一次错误，防止日志刷屏卡死终端
-            if (i == 0) { 
-                LOG(ERROR) << "RPC Call Failed! Reason: " << controller.ErrorText();
+            // 打印前几次错误，方便定位是哪个方法出错了
+            if (i < 2) { 
+                std::string method_str = is_login ? "Login" : "Register";
+                LOG(ERROR) << "RPC Call Failed! Method: " << method_str << ", Reason: " << controller.ErrorText();
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 失败后稍微让出CPU，避免疯狂重试
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue; 
         }
 
@@ -46,8 +62,7 @@ int main(int argc, char **argv) {
     const int thread_count = 100;      
     const int requests_per_thread = 5000; 
 
-    // 共享 Channel，测试多路复用
-    KrpcChannel* channel = new KrpcChannel(false); 
+    KrpcChannel* channel = new KrpcChannel(false);
     Kuser::UserServiceRpc_Stub stub(channel);
 
     std::vector<std::thread> threads;  
@@ -56,7 +71,7 @@ int main(int argc, char **argv) {
         all_latencies[i].reserve(requests_per_thread);
     }
 
-    LOG(INFO) << "Starting Benchmark...";
+    LOG(INFO) << "Starting Benchmark (Testing Multiple Methods)...";
     auto start_time = std::chrono::high_resolution_clock::now();  
 
     for (int i = 0; i < thread_count; i++) {
@@ -66,7 +81,7 @@ int main(int argc, char **argv) {
     }
 
     for (auto &t : threads) { t.join(); }
-    // 【添加这行】确保程序真的执行到了这里
+    
     LOG(INFO) << "All threads finished! Calculating results...";
     
     auto end_time = std::chrono::high_resolution_clock::now();  
@@ -83,7 +98,6 @@ int main(int argc, char **argv) {
     double p99_latency = merged_latencies[merged_latencies.size() * 0.99];
     double qps = (thread_count * requests_per_thread) / total_elapsed.count();
 
-    // 极限精简输出
     LOG(INFO) << "========= Benchmark Results =========";
     LOG(INFO) << "Total Requests : " << thread_count * requests_per_thread;
     LOG(INFO) << "QPS            : " << qps << " req/sec";

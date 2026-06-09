@@ -33,9 +33,15 @@ struct ConnectionContext {
 
 // 定义小哈希表（桶）结构
 struct PromiseBucket {
-        std::mutex mutex; // 这个桶专属的独立锁
-        std::unordered_map<uint64_t, std::promise<std::string>> pending_requests;
-    };
+    std::mutex mutex; // 这个桶专属的独立锁
+    std::unordered_map<uint64_t, std::promise<std::string>> pending_requests;
+};
+
+// 定义针对【单个服务】的独立路由表
+struct RouteTable {
+    size_t pool_size = 0; // 该服务当前存活的物理连接数
+    std::map<uint32_t, std::shared_ptr<ConnectionContext>> hash_ring; // 专属哈希环
+};
 
 class KrpcChannel : public google::protobuf::RpcChannel
 {
@@ -49,26 +55,17 @@ public:
                     ::google::protobuf::Closure *done) override; // override可以验证是否是虚函数
                     
 private:
-    std::string service_name;
-    std::string method_name;
-
     // 集群容灾核心组件
     ZkClient m_zkCli;                   // 持久化 ZK 客户端，保持与注册中心的 Session
-    std::string m_method_path;          // 需要持续监听的服务路径
     std::mutex m_route_mutex;           // 保护路由表，防止读写冲突
     std::mutex m_init_mutex;            // 专门保护双检锁初始化的锁！
 
-    // 一致性哈希核心组件
-    size_t m_pool_size = 0; // 记录当前存活的物理连接数
+    // 全量微服务路由网关核心组件
+    std::atomic<bool> m_is_zk_started{false}; // ZK 客户端是否已启动（全局只需启一次）
     
-    // 虚拟节点倍数：每个物理连接在环上映射出 150 个虚拟节点，解决数据倾斜！
+    // 核心大招：二维路由表 Key 是 method_path (如 /UserServiceRpc/Login)，并将Value 改为 shared_ptr，开启无锁化读！
+    std::unordered_map<std::string, std::shared_ptr<RouteTable>> m_service_routers;
     static const int VIRTUAL_NODES = 150; 
-    
-    // 哈希环 (Hash Ring)：Key 是哈希值(环上的位置)，Value 是具体的 TCP 连接
-    // map 底层是红黑树，天然支持按照 Key 有序排列，完美模拟圆环！
-    std::map<uint32_t, std::shared_ptr<ConnectionContext>> m_hash_ring;
-
-    std::atomic<bool> m_is_pool_inited{false}; // 标记连接池是否已完成初始化
 
     // 多路复用、段锁核心组件
     std::atomic<uint64_t> m_request_id_generator{0}; 
@@ -80,7 +77,7 @@ private:
     ssize_t recv_exact(int fd, char* buf, size_t size);
 
     // 动态刷新函数
-    void RefreshConnections(); // 执行路由表重建
+    void RefreshConnections(const std::string& method_path); // 执行路由表重建
     static void OnNodeChange(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx); // ZK 回调函数
 
     void ReadTask(int fd); // 后台接收线程
