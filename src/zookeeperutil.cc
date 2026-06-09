@@ -2,8 +2,6 @@
 #include "Krpcapplication.h"
 #include "KrpcLogger.h"
 
-
-
 // 全局的watcher观察器，用于接收ZooKeeper服务器的通知
 void global_watcher(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx) {
     if (type == ZOO_SESSION_EVENT) {  
@@ -96,4 +94,22 @@ std::string ZkClient::GetData(const char *path) {
         return buf;  // 返回节点数据
     }
     return "";  // 默认返回空字符串
+}
+
+std::vector<std::string> ZkClient::GetChildren(const char* path) {
+    struct String_vector strings;
+    // 调用原生的 zoo_get_children 获取所有子节点
+    int flag = zoo_get_children(m_zhandle, path, 0, &strings);
+    
+    std::vector<std::string> children;
+    if (flag == ZOK) {
+        for (int i = 0; i < strings.count; ++i) {
+            children.push_back(strings.data[i]);
+        }
+        // 释放 C 语言结构体的内存，防止内存泄漏！
+        deallocate_String_vector(&strings);
+    } else {
+        LOG(ERROR) << "zoo_get_children error, path: " << path;
+    }
+    return children;
 }

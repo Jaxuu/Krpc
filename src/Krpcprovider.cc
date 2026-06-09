@@ -72,17 +72,26 @@ void KrpcProvider::Run() {
     // 将当前RPC节点上要发布的服务全部注册到ZooKeeper上，让RPC客户端可以在ZooKeeper上发现服务
     ZkClient zkclient;
     zkclient.Start();  // 连接ZooKeeper服务器
-    // service_name为永久节点，method_name为临时节点
+
+    // service_name、method_name都是永久节点
     for (auto &sp : service_map) {
         // service_name 在ZooKeeper中的目录是"/"+service_name
         std::string service_path = "/" + sp.first;
         zkclient.Create(service_path.c_str(), nullptr, 0);  // 创建服务节点
+
         for (auto &mp : sp.second.method_map) {
+            // 改动1：方法节点现在必须也是持久化节点（相当于一个文件夹）
             std::string method_path = service_path + "/" + mp.first;
+            zkclient.Create(method_path.c_str(), nullptr, 0);
+            
+            // 改动2：将 IP:Port 拼接成具体的子节点路径
             char method_path_data[128] = {0};
-            sprintf(method_path_data, "%s:%d", ip.c_str(), port);  // 将IP和端口信息存入节点数据
-            // ZOO_EPHEMERAL表示这个节点是临时节点，在客户端断开连接后，ZooKeeper会自动删除这个节点
-            zkclient.Create(method_path.c_str(), method_path_data, strlen(method_path_data), ZOO_EPHEMERAL);
+            sprintf(method_path_data, "%s/%s:%d", method_path.c_str(), ip.c_str(), port);   // 将IP和端口信息存入节点数据
+            
+            // 改动3：创建这台机器专属的临时子节点！
+            // 路径如：/UserServiceRpc/Login/127.0.0.1:8000
+            // 当这台机器宕机，这个特定的子节点就会自动消失！
+            zkclient.Create(method_path_data, nullptr, 0, ZOO_EPHEMERAL);
         }
     }
 

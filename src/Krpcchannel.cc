@@ -74,15 +74,41 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
 
             ZkClient zkCli;
             zkCli.Start();  
-            std::string host_data = QueryServiceHost(&zkCli, service_name, method_name, m_idx);  
-            m_ip = host_data.substr(0, m_idx);  
-            m_port = atoi(host_data.substr(m_idx + 1, host_data.size() - m_idx).c_str());  
+            std::string method_path = "/" + service_name + "/" + method_name;
+            
+            // 拉取该方法下所有的活跃机器节点！
+            std::vector<std::string> hosts = zkCli.GetChildren(method_path.c_str());
+            if (hosts.empty()) {
+                controller->SetFailed("No active servers found for " + method_path);
+                return;
+            }
 
-            // 为池中的 4 条连接全部建连
-            for (int i = 0; i < m_pool_size; ++i) {
-                if (!connect_node(m_conn_pool[i].get(), m_ip.c_str(), m_port)) {
-                    LOG(ERROR) << "init connection pool failed for node " << i;
+            // 为发现的每一台机器，都建立 4 条多路复用连接，全部压平到 m_conn_pool 中
+            for (const auto& host : hosts) {
+                int idx = host.find(":");
+                if (idx != -1) {
+                    std::string node_ip = host.substr(0, idx);
+                    uint16_t node_port = atoi(host.substr(idx + 1).c_str());
+                    
+                    LOG(INFO) << "Discovered Node: " << node_ip << ":" << node_port;
+
+                    for (int i = 0; i < 4; ++i) { // 每台机器 4 条连接
+                        auto ctx = std::unique_ptr<ConnectionContext>(new ConnectionContext());
+                        ctx->ip = node_ip;
+                        ctx->port = node_port;
+                        if (connect_node(ctx.get(), node_ip.c_str(), node_port)) {
+                            m_conn_pool.push_back(std::move(ctx));
+                        } else {
+                            LOG(ERROR) << "Failed to connect " << node_ip << ":" << node_port;
+                        }
+                    }
                 }
+            }
+
+            m_pool_size = m_conn_pool.size(); // 动态计算池子总大小 (例如 3台机器 * 4 = 12)
+            if (m_pool_size == 0) {
+                controller->SetFailed("All connections to cluster failed");
+                return;
             }
             m_is_pool_inited = true; // 标记池初始化完成
         }
@@ -96,7 +122,8 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     if (!ctx->is_connected) {
         std::lock_guard<std::mutex> lock(ctx->send_mutex);
         if (!ctx->is_connected) {
-            if (!connect_node(ctx, m_ip.c_str(), m_port)) {
+            // 【注意这里】：使用当前连接专属的 ip 和 port 重连
+            if (!connect_node(ctx, ctx->ip.c_str(), ctx->port)) {
                 controller->SetFailed("selected connection is offline and reconnect failed");
                 return;
             }
@@ -203,31 +230,9 @@ bool KrpcChannel::connect_node(ConnectionContext* ctx, const char *ip, uint16_t 
     return true;
 }
 
-// 从ZooKeeper查询服务地址
-std::string KrpcChannel::QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx) {
-    std::string method_path = "/" + service_name + "/" + method_name;  // 构造ZooKeeper路径
-    std::string host_data_1 = zkclient->GetData(method_path.c_str());  // 从ZooKeeper获取数据
-
-    if (host_data_1 == "") {  // 如果未找到服务地址
-        LOG(ERROR) << method_path + " is not exist!";  // 记录错误日志
-        return " ";
-    }
-
-    idx = host_data_1.find(":");  // 查找IP和端口的分隔符
-    if (idx == -1) {  // 如果分隔符不存在
-        LOG(ERROR) << method_path + " address is invalid!";  // 记录错误日志
-        return " ";
-    }
-
-    return host_data_1;  // 返回服务地址
-}
-
-
-// 构造函数，支持延迟连接,
+// 构造函数
 KrpcChannel::KrpcChannel(bool connectNow) : m_idx(0) {
-    for (int i = 0; i < m_pool_size; ++i) {
-        m_conn_pool.push_back(std::unique_ptr<ConnectionContext>(new ConnectionContext()));
-    }
+    // 啥都不用写，全靠 CallMethod 里的双检锁进行懒加载和集群发现！
 }
 
 // 析构函数：安全释放连接池中的所有 fd

@@ -15,7 +15,11 @@
 struct ConnectionContext {
     int fd = -1;
     std::mutex send_mutex; // 每条连接专属的发送锁！
+    std::thread read_thread;
     std::atomic<bool> is_connected{false}; // 标记当前连接是否存活
+    // 新增：记录当前这个连接到底连的是谁
+    std::string ip;
+    uint16_t port = 0;
 };
 
 class ZkClient;
@@ -42,7 +46,7 @@ private:
     ssize_t recv_exact(int fd, char* buf, size_t size);
 
     // 连接池核心组件
-    const int m_pool_size = 4; // 工业界通常设为 4 或 8，不宜过大
+    size_t m_pool_size = 0; //线程池大小，改为运行时动态计算
     std::vector<std::unique_ptr<ConnectionContext>> m_conn_pool;
     std::atomic<uint32_t> m_pool_idx{0}; // 用于 Round-Robin 轮询的计数器
 

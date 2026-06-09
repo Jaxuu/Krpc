@@ -1,12 +1,12 @@
 #ifndef _zookeeperutil_h_
 #define _zookeeperutil_h_
 
-#include<zookeeper/zookeeper.h>
-#include<string>
+#include <zookeeper/zookeeper.h>
+#include <string>
 #include <mutex>
 #include <condition_variable>
-#include<semaphore.h>
-
+#include <semaphore.h>
+#include <vector>
 
 //封装的zk客户端
 class ZkClient
@@ -23,6 +23,9 @@ public:
     //提供给 watcher 回调使用的唤醒接口
     void NotifyConnected();
 
+    // 获取指定节点下的所有子节点列表
+    std::vector<std::string> GetChildren(const char* path);
+
 private:
     //Zk的客户端句柄
     zhandle_t* m_zhandle;
@@ -32,3 +35,4 @@ private:
     bool m_connected;               // 标记ZooKeeper客户端是否连接成功
 };
 #endif
+

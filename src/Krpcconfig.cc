@@ -7,14 +7,11 @@
 void Krpcconfig::LoadConfigFile(const char *config_file) {
     FILE *pf = fopen(config_file, "r");
     if (pf == nullptr) {
-        std::cerr << "[Warning] 找不到配置文件: " << config_file 
-                  << "，将使用默认本地配置 (127.0.0.1)!" << std::endl;
-        // 设置默认值
-        config_map["rpcserverip"] = "127.0.0.1";
-        config_map["rpcserverport"] = "8002";
-        config_map["zookeeperip"] = "127.0.0.1";
-        config_map["zookeeperport"] = "2181";
-        return;
+        // 不要兜底！直接报 Fatal 错误并退出进程！
+        std::cerr << "[FATAL ERROR] 找不到或无法打开配置文件: " 
+                  << (config_file ? config_file : "null") 
+                  << " \n请检查启动参数路径是否正确！(例如: ./server -i ../conf/test.conf)" << std::endl;
+        exit(EXIT_FAILURE); 
     }
 
     // 使用智能指针管理文件指针，确保文件在退出时自动fclose
