@@ -4,11 +4,13 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <thread>
+#include <sys/uio.h> // 提供 iovec 和 sendmsg 等高阶网络 I/O 接口
 #include "zookeeperutil.h"
 #include "Krpcheader.pb.h"
 #include "Krpcapplication.h"
 #include "Krpccontroller.h"
 #include "KrpcLogger.h"
+
 
 // 新增后台独立接收线程，解析响应并精准唤醒对应的业务线程
 void KrpcChannel::ReadTask(int fd) {
@@ -76,7 +78,6 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     uint64_t current_id = m_request_id_generator.fetch_add(1);
 
     // 拼装出本次请求的目标服务路径
-    const google::protobuf::ServiceDescriptor *sd = method->service();
     std::string service_name = method->service()->name();  
     std::string method_name = method->name();
     std::string method_path = "/" + service_name + "/" + method_name;
@@ -179,14 +180,7 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     uint32_t net_total_len = htonl(total_len);
     uint32_t net_header_len = htonl(header_size);
 
-    std::string send_rpc_str;
-    send_rpc_str.reserve(4 + 4 + header_size + args_str.size());
-    send_rpc_str.append((char*)&net_total_len, 4);
-    send_rpc_str.append((char*)&net_header_len, 4);
-    send_rpc_str.append(rpc_header_str);
-    send_rpc_str.append(args_str);
-
-    // 6. 注册 promise
+    // 6. 注册 promise(先注册，准备收包)
     std::promise<std::string> prom;
     std::future<std::string> fut = prom.get_future();
 
@@ -199,16 +193,50 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
         bucket->pending_requests[current_id] = std::move(prom);
     }
 
-    // 7. 发送数据：使用专属连接的 send_mutex 和 fd！并发度大幅提升
+    // 7. 自适应双擎发包策略
     {
         std::lock_guard<std::mutex> lock(ctx->send_mutex);
-        // 关键修改:将最后一个参数 0 改为 MSG_NOSIGNAL
-        if (-1 == send(ctx->fd, send_rpc_str.c_str(), send_rpc_str.size(), MSG_NOSIGNAL)) {
+        int send_result = -1;
+
+        if (total_len < 256) {
+            // 针对小包：极速缓存拼接，利用 CPU L1 缓存极速暴力拷贝，避免内核机制开销
+            std::string send_rpc_str;
+            send_rpc_str.reserve(4 + 4 + header_size + args_str.size());
+            send_rpc_str.append((char*)&net_total_len, 4);
+            send_rpc_str.append((char*)&net_header_len, 4);
+            send_rpc_str.append(rpc_header_str);
+            send_rpc_str.append(args_str);
+
+            send_result = send(ctx->fd, send_rpc_str.c_str(), send_rpc_str.size(), MSG_NOSIGNAL);
+        } else {
+            // 针对大包（如海量数据拉取）：DMA 聚集写，告别内存拼接，由操作系统网卡驱动进行底层零拷贝
+            struct iovec iov[4];
+            iov[0].iov_base = &net_total_len;
+            iov[0].iov_len  = 4;
+            iov[1].iov_base = &net_header_len;
+            iov[1].iov_len  = 4;
+            // string 的 data() 返回 const char*，iovec 需要 void*，进行强转
+            iov[2].iov_base = (void*)rpc_header_str.data(); 
+            iov[2].iov_len  = rpc_header_str.size();
+            iov[3].iov_base = (void*)args_str.data();
+            iov[3].iov_len  = args_str.size();
+
+            struct msghdr msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_iov = iov;
+            msg.msg_iovlen = 4; // 告诉内核，有 4 块碎片内存需要合并发送
+
+            send_result = sendmsg(ctx->fd, &msg, MSG_NOSIGNAL);
+        }
+
+        // 统一处理发送失败的容灾兜底逻辑
+        if (-1 == send_result) {
             close(ctx->fd);
             ctx->fd = -1;
-            ctx->is_connected = false; // 标记断开，下次用到会重连
-            controller->SetFailed("send error");
+            ctx->is_connected = false; // 标记断开，触发下一轮自动重连
+            controller->SetFailed("network send error");
 
+            // 发送失败，必须把注册的 promise 擦除掉，防止内存泄漏
             std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
             bucket->pending_requests.erase(current_id);
             return;

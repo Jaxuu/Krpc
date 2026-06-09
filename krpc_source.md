@@ -1,6 +1,6 @@
 # KRPC Project Source Collection
 
-- Generated at: 2026-06-08 20:32:52
+- Generated at: 2026-06-09 18:49:52
 - Project root: `/home/ysh/projects/Krpc-main`
 - File count: 22
 - Excluded: `*.pb.cc`, `*.pb.h`, build/bin/.git/third_party/vendor/log directories
@@ -40,7 +40,7 @@ cmake_minimum_required(VERSION 3.0)
 project(Krpc)
 
 #设置全局的C++标准
-set(CMAKE_CXX_STANDARD 11)#在这里我设置了11，代表使用c++11标准
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)#CMAKE_CXX_STANDARD_REQUIRED表示强制使用指定的标准
 
 #设置头文件目录，供所有子项目使用
@@ -105,65 +105,82 @@ set_target_properties(server PROPERTIES
 ```cpp
 #include <iostream>
 #include <string>
+#include <unordered_map>
+#include <shared_mutex> // C++17 读写锁
 #include "../user.pb.h"
 #include "Krpcapplication.h"
 #include "Krpcprovider.h"
 
-/*
-UserService 原本是一个本地服务，提供了两个本地方法：Login 和 GetFriendLists。
-现在通过 RPC 框架，这些方法可以被远程调用。
-*/
-class UserService : public Kuser::UserServiceRpc // 继承自 protobuf 生成的 RPC 服务基类
+class UserService : public Kuser::UserServiceRpc 
 {
+private:
+    std::unordered_map<std::string, std::string> m_user_db; 
+    std::shared_mutex m_db_mutex; // 读写分离锁
+
 public:
-    // 本地登录方法，用于处理实际的业务逻辑
-    bool Login(std::string name, std::string pwd) {
-        std::cout << "doing local service: Login" << std::endl;
-        std::cout << "name:" << name << " pwd:" << pwd << std::endl;  
-        return true;  // 模拟登录成功
+    // 1. 本地注册方法 (排他写)
+    bool Register(std::string name, std::string pwd, std::string& err_msg) {
+        std::unique_lock<std::shared_mutex> lock(m_db_mutex);
+        if (m_user_db.find(name) != m_user_db.end()) {
+            err_msg = "Register Failed: already exists!";
+            return false;
+        }
+        m_user_db[name] = pwd;
+        return true;
     }
 
-    /*
-    重写基类 UserServiceRpc 的虚函数，这些方法会被 RPC 框架直接调用。
-    1. 调用者（caller）通过 RPC 框架发送 Login 请求。
-    2. 服务提供者（callee）接收到请求后，调用下面重写的 Login 方法。
-    */
-    void Login(::google::protobuf::RpcController* controller,
-              const ::Kuser::LoginRequest* request,
-              ::Kuser::LoginResponse* response,
-              ::google::protobuf::Closure* done) {
-        // 从请求中获取用户名和密码
-        std::string name = request->name();
-        std::string pwd = request->pwd();
+    // 2. 本地登录方法 (无界并发读) —— 性能起飞的核心！
+    bool Login(std::string name, std::string pwd, std::string& err_msg) {
+        std::shared_lock<std::shared_mutex> lock(m_db_mutex);
+        auto it = m_user_db.find(name);
+        if (it == m_user_db.end()) {
+            err_msg = "Login Failed: not found!";
+            return false;
+        }
+        if (it->second != pwd) {
+            err_msg = "Login Failed: wrong pwd!";
+            return false;
+        }
+        return true;  
+    }
 
-        // 调用本地业务逻辑处理登录
-        bool login_result = Login(name, pwd); 
+    // 重写 Register RPC 方法
+    void Register(::google::protobuf::RpcController* controller,
+                  const ::Kuser::RegisterRequest* request,
+                  ::Kuser::RegisterResponse* response,
+                  ::google::protobuf::Closure* done) override {
+        std::string err_msg;
+        bool register_result = Register(request->name(), request->pwd(), err_msg); 
 
-        // 将响应结果写入 response 对象
         Kuser::ResultCode *code = response->mutable_result();
-        code->set_errcode(0);  // 设置错误码为 0，表示成功
-        code->set_errmsg("");  // 设置错误信息为空
-        response->set_success(login_result);  // 设置登录结果
+        code->set_errcode(register_result ? 0 : 1);
+        code->set_errmsg(err_msg);
+        response->set_success(register_result);
+        done->Run();
+    }
 
-        // 执行回调操作，框架会自动将响应序列化并发送给调用者
+    // 重写 Login RPC 方法
+    void Login(::google::protobuf::RpcController* controller,
+               const ::Kuser::LoginRequest* request,
+               ::Kuser::LoginResponse* response,
+               ::google::protobuf::Closure* done) override {
+        std::string err_msg;
+        bool login_result = Login(request->name(), request->pwd(), err_msg); 
+
+        Kuser::ResultCode *code = response->mutable_result();
+        code->set_errcode(login_result ? 0 : 1);
+        code->set_errmsg(err_msg);
+        response->set_success(login_result);
         done->Run();
     }
 };
 
 int main(int argc, char **argv) {
-    // 调用框架的初始化操作，解析命令行参数并加载配置文件
     KrpcApplication::Init(argc, argv);
-
-    // 创建一个 RPC 服务提供者对象
     KrpcProvider provider;
-
-    // 将 UserService 对象发布到 RPC 节点上，使其可以被远程调用
     UserService my_service;
     provider.NotifyService(&my_service);
-
-    // 启动 RPC 服务节点，进入阻塞状态，等待远程的 RPC 调用请求
     provider.Run();
-
     return 0;
 }
 ```
@@ -209,27 +226,43 @@ set_target_properties(client PROPERTIES
 #include <algorithm>
 #include "KrpcLogger.h"
 
-// 压测函数
+// 压测函数：交替测试 Login 和 Register
 void send_request(Kuser::UserServiceRpc_Stub* stub, int requests_per_thread, std::vector<double>& local_latencies) {
-    Kuser::LoginRequest request;
-    request.set_name("benchmark_user");  
-    request.set_pwd("123456");    
-    Kuser::LoginResponse response;
+    // 1. 构造 Login 请求
+    Kuser::LoginRequest login_request;
+    login_request.set_name("benchmark_user");  
+    login_request.set_pwd("123456");    
+    Kuser::LoginResponse login_response;
+
+    // 2. 构造 Register 请求 
+    // (如果你的 RegisterRequest 有不同的字段，请在这里按需修改)
+    Kuser::RegisterRequest register_request;
+    register_request.set_name("benchmark_new_user");
+    register_request.set_pwd("654321");
+    // register_request.set_id(1001); 
+    Kuser::RegisterResponse register_response;
 
     for (int i = 0; i < requests_per_thread; ++i) {
         Krpccontroller controller;
         auto req_start = std::chrono::high_resolution_clock::now();
         
-        // 发起 RPC 调用
-        stub->Login(&controller, &request, &response, nullptr);
+        // 核心测试点：单数发 Login，双数发 Register
+        bool is_login = (i % 2 == 0);
+        
+        if (is_login) {
+            stub->Login(&controller, &login_request, &login_response, nullptr);
+        } else {
+            stub->Register(&controller, &register_request, &register_response, nullptr);
+        }
 
-        // 新增验证逻辑：如果调用失败，直接退出或跳过，千万别算进成功耗时里！
+        // 失败拦截
         if (controller.Failed()) {
-            // 只打印一次错误，防止日志刷屏卡死终端
-            if (i == 0) { 
-                LOG(ERROR) << "RPC Call Failed! Reason: " << controller.ErrorText();
+            // 打印前几次错误，方便定位是哪个方法出错了
+            if (i < 2) { 
+                std::string method_str = is_login ? "Login" : "Register";
+                LOG(ERROR) << "RPC Call Failed! Method: " << method_str << ", Reason: " << controller.ErrorText();
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 失败后稍微让出CPU，避免疯狂重试
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue; 
         }
 
@@ -246,8 +279,7 @@ int main(int argc, char **argv) {
     const int thread_count = 100;      
     const int requests_per_thread = 5000; 
 
-    // 共享 Channel，测试多路复用
-    KrpcChannel* channel = new KrpcChannel(false); 
+    KrpcChannel* channel = new KrpcChannel(false);
     Kuser::UserServiceRpc_Stub stub(channel);
 
     std::vector<std::thread> threads;  
@@ -256,7 +288,7 @@ int main(int argc, char **argv) {
         all_latencies[i].reserve(requests_per_thread);
     }
 
-    LOG(INFO) << "Starting Benchmark...";
+    LOG(INFO) << "Starting Benchmark (Testing Multiple Methods)...";
     auto start_time = std::chrono::high_resolution_clock::now();  
 
     for (int i = 0; i < thread_count; i++) {
@@ -266,7 +298,7 @@ int main(int argc, char **argv) {
     }
 
     for (auto &t : threads) { t.join(); }
-    // 【添加这行】确保程序真的执行到了这里
+    
     LOG(INFO) << "All threads finished! Calculating results...";
     
     auto end_time = std::chrono::high_resolution_clock::now();  
@@ -283,7 +315,6 @@ int main(int argc, char **argv) {
     double p99_latency = merged_latencies[merged_latencies.size() * 0.99];
     double qps = (thread_count * requests_per_thread) / total_elapsed.count();
 
-    // 极限精简输出
     LOG(INFO) << "========= Benchmark Results =========";
     LOG(INFO) << "Total Requests : " << thread_count * requests_per_thread;
     LOG(INFO) << "QPS            : " << qps << " req/sec";
@@ -448,11 +479,13 @@ Krpcconfig& KrpcApplication::GetConfig() {
 #include <arpa/inet.h>
 #include <errno.h>
 #include <thread>
+#include <sys/uio.h> // 提供 iovec 和 sendmsg 等高阶网络 I/O 接口
 #include "zookeeperutil.h"
 #include "Krpcheader.pb.h"
 #include "Krpcapplication.h"
 #include "Krpccontroller.h"
 #include "KrpcLogger.h"
+
 
 // 新增后台独立接收线程，解析响应并精准唤醒对应的业务线程
 void KrpcChannel::ReadTask(int fd) {
@@ -477,11 +510,19 @@ void KrpcChannel::ReadTask(int fd) {
         std::string response_str(body_buf.data(), body_len);
 
         uint64_t req_id = krpcheader.request_id();
-        std::lock_guard<std::mutex> lock(m_promise_mutex);
-        auto it = m_pending_requests.find(req_id);
-        if (it != m_pending_requests.end()) {
-            it->second.set_value(response_str); 
-            m_pending_requests.erase(it);       
+
+        // 同样通过 req_id 取模，找到这个请求对应的桶
+        size_t bucket_index = req_id % BUCKET_NUM;
+        auto& bucket = m_promise_buckets[bucket_index];
+
+        {
+            // 只锁住这个特定的桶，绝不会阻塞正在写入其他桶的线程！
+            std::lock_guard<std::mutex> lock(bucket->mutex);
+            auto it = bucket->pending_requests.find(req_id);
+            if (it != bucket->pending_requests.end()) {
+                it->second.set_value(response_str); 
+                bucket->pending_requests.erase(it);       
+            }
         }
     }
 }
@@ -508,53 +549,94 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
                              ::google::protobuf::Message *response,
                              ::google::protobuf::Closure *done)
 {
-    // 1. 双检锁初始化整个连接池
-    if (!m_is_pool_inited) {  
-        std::lock_guard<std::mutex> lock(m_conn_mutex);
-        if (!m_is_pool_inited) {
-            const google::protobuf::ServiceDescriptor *sd = method->service();
-            service_name = sd->name();  
-            method_name = method->name();  
+    // 提早生成唯一的路由 Key！
+    uint64_t current_id = m_request_id_generator.fetch_add(1);
 
-            ZkClient zkCli;
-            zkCli.Start();  
-            std::string host_data = QueryServiceHost(&zkCli, service_name, method_name, m_idx);  
-            m_ip = host_data.substr(0, m_idx);  
-            m_port = atoi(host_data.substr(m_idx + 1, host_data.size() - m_idx).c_str());  
+    // 拼装出本次请求的目标服务路径
+    std::string service_name = method->service()->name();  
+    std::string method_name = method->name();
+    std::string method_path = "/" + service_name + "/" + method_name;
 
-            // 为池中的 4 条连接全部建连
-            for (int i = 0; i < m_pool_size; ++i) {
-                if (!connect_node(m_conn_pool[i].get(), m_ip.c_str(), m_port)) {
-                    LOG(ERROR) << "init connection pool failed for node " << i;
-                }
-            }
-            m_is_pool_inited = true; // 标记池初始化完成
+    // 1. ZK 客户端全局只启动一次
+    if (!m_is_zk_started) {
+        std::lock_guard<std::mutex> lock(m_init_mutex); 
+        if (!m_is_zk_started) {
+            m_zkCli.Start(); 
+            m_is_zk_started = true; 
         }
     }
 
-    // 2. 轮询（Round-Robin）选择一条连接
-    uint32_t idx = m_pool_idx.fetch_add(1) % m_pool_size;
-    ConnectionContext* ctx = m_conn_pool[idx].get();
+    // 2. 从专属路由表中获取连接
+    std::shared_ptr<ConnectionContext> ctx;
+    std::shared_ptr<RouteTable> target_route_table; // 用来接住当前路由表的快照
+    {
+        std::lock_guard<std::mutex> lock(m_route_mutex);
+        auto route_it = m_service_routers.find(method_path);
+        if (route_it != m_service_routers.end()) {
+            target_route_table = route_it->second; // 拿到快照，引用计数+1
+        }
+    }
 
-    // 容错机制：如果选中的连接断开了，尝试重连
+    // 3. 如果没找到，说明是该服务第一次被调用，按需建环！
+    if (!target_route_table) {
+        std::lock_guard<std::mutex> lock(m_init_mutex); // 防止多个线程同时去建环
+        
+        // 再次检查是否被其他线程建好了 (Double-Checked Locking)
+        {
+            std::lock_guard<std::mutex> r_lock(m_route_mutex);
+            auto route_it = m_service_routers.find(method_path);
+            if (route_it != m_service_routers.end()) {
+                target_route_table = route_it->second;
+            }
+        }
+        
+        // 真的没建好，去 ZK 拉取
+        if (!target_route_table) {
+            RefreshConnections(method_path);
+            // 建好之后拿出来
+            std::lock_guard<std::mutex> r_lock(m_route_mutex);
+            target_route_table = m_service_routers[method_path];
+        }
+    }
+
+    if (!target_route_table || target_route_table->hash_ring.empty()) {
+        controller->SetFailed("Fatal Error: Cluster is down for service: " + method_path);
+        return;
+    }
+
+    // 4. 完全无锁化并行执行区
+    // 🚀 性能与分布兼顾的整数哈希 (Integer Avalanche Hash)
+    // 只有 3 条极快的位运算指令，不仅避免了 std::string 拷贝，还能将 1,2,3 彻底打散到 2^32 整个圆环上！
+    uint32_t hash_val = current_id;
+    hash_val ^= hash_val >> 16;
+    hash_val *= 0x85ebca6b;
+    hash_val ^= hash_val >> 13;
+    hash_val *= 0xc2b2ae35;
+    hash_val ^= hash_val >> 16;
+
+    auto it = target_route_table->hash_ring.upper_bound(hash_val);
+    if (it == target_route_table->hash_ring.end()) {
+        it = target_route_table->hash_ring.begin();
+    }
+    ctx = it->second;
+
+    // 断线重连兜底
     if (!ctx->is_connected) {
         std::lock_guard<std::mutex> lock(ctx->send_mutex);
         if (!ctx->is_connected) {
-            if (!connect_node(ctx, m_ip.c_str(), m_port)) {
-                controller->SetFailed("selected connection is offline and reconnect failed");
+            if (!connect_node(ctx.get(), ctx->ip.c_str(), ctx->port)) {
+                controller->SetFailed("Selected connection is offline");
                 return;
             }
         }
     }
 
-    // 3. 序列化请求头与包体
+    // 5. 序列化请求头与包体
     std::string args_str;
     if (!request->SerializeToString(&args_str)) {
         controller->SetFailed("serialize request fail");
         return;
     }
-
-    uint64_t current_id = m_request_id_generator.fetch_add(1);
 
     Krpc::RpcHeader krpcheader;
     krpcheader.set_service_name(service_name);
@@ -573,40 +655,74 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     uint32_t net_total_len = htonl(total_len);
     uint32_t net_header_len = htonl(header_size);
 
-    std::string send_rpc_str;
-    send_rpc_str.reserve(4 + 4 + header_size + args_str.size());
-    send_rpc_str.append((char*)&net_total_len, 4);
-    send_rpc_str.append((char*)&net_header_len, 4);
-    send_rpc_str.append(rpc_header_str);
-    send_rpc_str.append(args_str);
-
-    // 4. 在全局表中注册 promise
+    // 6. 注册 promise(先注册，准备收包)
     std::promise<std::string> prom;
     std::future<std::string> fut = prom.get_future();
+
+    // 通过 request_id 取模，计算这个请求该去哪个桶排队
+    size_t bucket_index = current_id % BUCKET_NUM;
+    auto& bucket = m_promise_buckets[bucket_index];
     {
-        std::lock_guard<std::mutex> lock(m_promise_mutex);
-        m_pending_requests[current_id] = std::move(prom);
+        // 只锁这 1/16 的区域！
+        std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+        bucket->pending_requests[current_id] = std::move(prom);
     }
 
-    // 5. 发送数据：使用专属连接的 send_mutex 和 fd！并发度大幅提升
+    // 7. 自适应双擎发包策略
     {
         std::lock_guard<std::mutex> lock(ctx->send_mutex);
-        if (-1 == send(ctx->fd, send_rpc_str.c_str(), send_rpc_str.size(), 0)) {
+        int send_result = -1;
+
+        if (total_len < 256) {
+            // 针对小包：极速缓存拼接，利用 CPU L1 缓存极速暴力拷贝，避免内核机制开销
+            std::string send_rpc_str;
+            send_rpc_str.reserve(4 + 4 + header_size + args_str.size());
+            send_rpc_str.append((char*)&net_total_len, 4);
+            send_rpc_str.append((char*)&net_header_len, 4);
+            send_rpc_str.append(rpc_header_str);
+            send_rpc_str.append(args_str);
+
+            send_result = send(ctx->fd, send_rpc_str.c_str(), send_rpc_str.size(), MSG_NOSIGNAL);
+        } else {
+            // 针对大包（如海量数据拉取）：DMA 聚集写，告别内存拼接，由操作系统网卡驱动进行底层零拷贝
+            struct iovec iov[4];
+            iov[0].iov_base = &net_total_len;
+            iov[0].iov_len  = 4;
+            iov[1].iov_base = &net_header_len;
+            iov[1].iov_len  = 4;
+            // string 的 data() 返回 const char*，iovec 需要 void*，进行强转
+            iov[2].iov_base = (void*)rpc_header_str.data(); 
+            iov[2].iov_len  = rpc_header_str.size();
+            iov[3].iov_base = (void*)args_str.data();
+            iov[3].iov_len  = args_str.size();
+
+            struct msghdr msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_iov = iov;
+            msg.msg_iovlen = 4; // 告诉内核，有 4 块碎片内存需要合并发送
+
+            send_result = sendmsg(ctx->fd, &msg, MSG_NOSIGNAL);
+        }
+
+        // 统一处理发送失败的容灾兜底逻辑
+        if (-1 == send_result) {
             close(ctx->fd);
             ctx->fd = -1;
-            ctx->is_connected = false; // 标记断开，下次用到会重连
-            controller->SetFailed("send error");
-            std::lock_guard<std::mutex> plock(m_promise_mutex);
-            m_pending_requests.erase(current_id);
+            ctx->is_connected = false; // 标记断开，触发下一轮自动重连
+            controller->SetFailed("network send error");
+
+            // 发送失败，必须把注册的 promise 擦除掉，防止内存泄漏
+            std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+            bucket->pending_requests.erase(current_id);
             return;
         }
     }
 
-    // 6. 等待各自专属的 ReadTask 唤醒
+    // 8. 等待各自专属的 ReadTask 唤醒
     if (fut.wait_for(std::chrono::seconds(3)) == std::future_status::timeout) {
         controller->SetFailed("rpc call timeout");
-        std::lock_guard<std::mutex> lock(m_promise_mutex);
-        m_pending_requests.erase(current_id);
+        std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+        bucket->pending_requests.erase(current_id);
         return;
     }
 
@@ -647,42 +763,69 @@ bool KrpcChannel::connect_node(ConnectionContext* ctx, const char *ip, uint16_t 
     return true;
 }
 
-// 从ZooKeeper查询服务地址
-std::string KrpcChannel::QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx) {
-    std::string method_path = "/" + service_name + "/" + method_name;  // 构造ZooKeeper路径
-    std::string host_data_1 = zkclient->GetData(method_path.c_str());  // 从ZooKeeper获取数据
+// 当 ZooKeeper 发现服务器宕机或新上线时，会自动触发这个回调
+void KrpcChannel::OnNodeChange(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx) {
+    if (type == ZOO_CHILD_EVENT) { // 如果是子节点（IP目录）发生变动
+        KrpcChannel* channel = static_cast<KrpcChannel*>(watcherCtx);
+        LOG(WARNING) << "🚨 [容灾警报] ZooKeeper 探测到节点上下线，触发动态路由表重建: " << path;
 
-    if (host_data_1 == "") {  // 如果未找到服务地址
-        LOG(ERROR) << method_path + " is not exist!";  // 记录错误日志
-        return " ";
-    }
-
-    idx = host_data_1.find(":");  // 查找IP和端口的分隔符
-    if (idx == -1) {  // 如果分隔符不存在
-        LOG(ERROR) << method_path + " address is invalid!";  // 记录错误日志
-        return " ";
-    }
-
-    return host_data_1;  // 返回服务地址
-}
-
-
-// 构造函数，支持延迟连接,
-KrpcChannel::KrpcChannel(bool connectNow) : m_idx(0) {
-    for (int i = 0; i < m_pool_size; ++i) {
-        m_conn_pool.push_back(std::unique_ptr<ConnectionContext>(new ConnectionContext()));
+        // 直接将变化的服务路径传给刷新函数，只重建这一个服务的哈希环！
+        channel->RefreshConnections(path);
     }
 }
 
-// 析构函数：安全释放连接池中的所有 fd
-KrpcChannel::~KrpcChannel() {
-    for (auto& ctx : m_conn_pool) {
-        if (ctx->fd >= 0) {
-            close(ctx->fd);
-            ctx->fd = -1;
+// 核心的“无锁化”路由表热替换逻辑
+void KrpcChannel::RefreshConnections(const std::string& method_path) {
+    // 1. 拉取特定服务的最新列表，并且重新挂载 Watcher，因为 ZK 的 Watcher 是一次性的！
+    std::vector<std::string> hosts = m_zkCli.GetChildrenWithWatch(method_path.c_str(), &KrpcChannel::OnNodeChange, this);
+
+    // 创建一个全新的 shared_ptr 路由表
+    auto new_route_table = std::make_shared<RouteTable>();
+    std::hash<std::string> hash_fn; // C++11 标准字符串哈希函数
+    
+    for (const auto& host : hosts) {
+        int idx = host.find(":");
+        if (idx != -1) {
+            std::string node_ip = host.substr(0, idx);
+            uint16_t node_port = atoi(host.substr(idx + 1).c_str());
+            
+            for (int i = 0; i < 4; ++i) { 
+                auto ctx = std::make_shared<ConnectionContext>();
+                ctx->ip = node_ip;
+                ctx->port = node_port;
+                if (connect_node(ctx.get(), node_ip.c_str(), node_port)) {
+                    new_route_table->pool_size++;
+
+                    for (int v = 0; v < VIRTUAL_NODES; ++v) {
+                        std::string vnode_name = node_ip + ":" + std::to_string(node_port) 
+                                                 + "_conn" + std::to_string(i) 
+                                                 + "_VN" + std::to_string(v);
+                        uint32_t hash_val = hash_fn(vnode_name);
+                        // 挂载到临时路由表中
+                        new_route_table->hash_ring[hash_val] = ctx; 
+                    }
+                }
+            }
         }
     }
+
+    // 2. 瞬间原子化替换特定哈希环！
+    {
+        std::lock_guard<std::mutex> lock(m_route_mutex);
+        m_service_routers[method_path] = new_route_table;
+    }
+
+    LOG(INFO) << "✅ 服务 [" << method_path << "] 路由表重建完成！活跃连接: " 
+              << new_route_table->pool_size << "，虚拟节点: " << new_route_table->hash_ring.size();
 }
+
+KrpcChannel::KrpcChannel(bool connectNow) {// 预先分配好 16 个带有独立锁的哈希表桶
+    for (size_t i = 0; i < BUCKET_NUM; ++i) {
+        m_promise_buckets.push_back(std::unique_ptr<PromiseBucket>(new PromiseBucket()));
+    }
+}
+
+KrpcChannel::~KrpcChannel() {}
 ```
 
 ---
@@ -699,14 +842,11 @@ KrpcChannel::~KrpcChannel() {
 void Krpcconfig::LoadConfigFile(const char *config_file) {
     FILE *pf = fopen(config_file, "r");
     if (pf == nullptr) {
-        std::cerr << "[Warning] 找不到配置文件: " << config_file 
-                  << "，将使用默认本地配置 (127.0.0.1)!" << std::endl;
-        // 设置默认值
-        config_map["rpcserverip"] = "127.0.0.1";
-        config_map["rpcserverport"] = "8002";
-        config_map["zookeeperip"] = "127.0.0.1";
-        config_map["zookeeperport"] = "2181";
-        return;
+        // 不要兜底！直接报 Fatal 错误并退出进程！
+        std::cerr << "[FATAL ERROR] 找不到或无法打开配置文件: " 
+                  << (config_file ? config_file : "null") 
+                  << " \n请检查启动参数路径是否正确！(例如: ./server -i ../conf/test.conf)" << std::endl;
+        exit(EXIT_FAILURE); 
     }
 
     // 使用智能指针管理文件指针，确保文件在退出时自动fclose
@@ -913,17 +1053,26 @@ void KrpcProvider::Run() {
     // 将当前RPC节点上要发布的服务全部注册到ZooKeeper上，让RPC客户端可以在ZooKeeper上发现服务
     ZkClient zkclient;
     zkclient.Start();  // 连接ZooKeeper服务器
-    // service_name为永久节点，method_name为临时节点
+
+    // service_name、method_name都是永久节点
     for (auto &sp : service_map) {
         // service_name 在ZooKeeper中的目录是"/"+service_name
         std::string service_path = "/" + sp.first;
         zkclient.Create(service_path.c_str(), nullptr, 0);  // 创建服务节点
+
         for (auto &mp : sp.second.method_map) {
+            // 改动1：方法节点现在必须也是持久化节点（相当于一个文件夹）
             std::string method_path = service_path + "/" + mp.first;
+            zkclient.Create(method_path.c_str(), nullptr, 0);
+            
+            // 改动2：将 IP:Port 拼接成具体的子节点路径
             char method_path_data[128] = {0};
-            sprintf(method_path_data, "%s:%d", ip.c_str(), port);  // 将IP和端口信息存入节点数据
-            // ZOO_EPHEMERAL表示这个节点是临时节点，在客户端断开连接后，ZooKeeper会自动删除这个节点
-            zkclient.Create(method_path.c_str(), method_path_data, strlen(method_path_data), ZOO_EPHEMERAL);
+            sprintf(method_path_data, "%s/%s:%d", method_path.c_str(), ip.c_str(), port);   // 将IP和端口信息存入节点数据
+            
+            // 改动3：创建这台机器专属的临时子节点！
+            // 路径如：/UserServiceRpc/Login/127.0.0.1:8000
+            // 当这台机器宕机，这个特定的子节点就会自动消失！
+            zkclient.Create(method_path_data, nullptr, 0, ZOO_EPHEMERAL);
         }
     }
 
@@ -1144,16 +1293,39 @@ class KrpcApplication
 #include <atomic>
 #include <vector>
 #include <memory>
-#include <sys/types.h> // 提供 ssize_t 定义
+#include <sys/types.h>
+#include <map>
+#include "zookeeperutil.h"
 
 // 每条TCP连接的独立上下文
 struct ConnectionContext {
     int fd = -1;
     std::mutex send_mutex; // 每条连接专属的发送锁！
     std::atomic<bool> is_connected{false}; // 标记当前连接是否存活
+    // 记录当前这个连接到底连的是谁
+    std::string ip;
+    uint16_t port = 0;
+    // 利用 RAII 机制，当这个上下文被销毁时，自动切断底层的网线
+    ~ConnectionContext() {
+        if (fd >= 0) {
+            close(fd); 
+            // 只要这里 close 了 fd，后台正在阻塞 recv 的 ReadTask 就会瞬间收到 0，退出循环并安全结束线程！
+            fd = -1;
+        }
+    }
 };
 
-class ZkClient;
+// 定义小哈希表（桶）结构
+struct PromiseBucket {
+    std::mutex mutex; // 这个桶专属的独立锁
+    std::unordered_map<uint64_t, std::promise<std::string>> pending_requests;
+};
+
+// 定义针对【单个服务】的独立路由表
+struct RouteTable {
+    size_t pool_size = 0; // 该服务当前存活的物理连接数
+    std::map<uint32_t, std::shared_ptr<ConnectionContext>> hash_ring; // 专属哈希环
+};
 
 class KrpcChannel : public google::protobuf::RpcChannel
 {
@@ -1165,30 +1337,33 @@ public:
                     const ::google::protobuf::Message *request,
                     ::google::protobuf::Message *response,
                     ::google::protobuf::Closure *done) override; // override可以验证是否是虚函数
+                    
 private:
-    std::string service_name;
-    std::string m_ip;
-    uint16_t m_port;
-    std::string method_name;
-    int m_idx; // 用来划分服务器ip和port的下标
+    // 集群容灾核心组件
+    ZkClient m_zkCli;                   // 持久化 ZK 客户端，保持与注册中心的 Session
+    std::mutex m_route_mutex;           // 保护路由表，防止读写冲突
+    std::mutex m_init_mutex;            // 专门保护双检锁初始化的锁！
 
+    // 全量微服务路由网关核心组件
+    std::atomic<bool> m_is_zk_started{false}; // ZK 客户端是否已启动（全局只需启一次）
+    
+    // 核心大招：二维路由表 Key 是 method_path (如 /UserServiceRpc/Login)，并将Value 改为 shared_ptr，开启无锁化读！
+    std::unordered_map<std::string, std::shared_ptr<RouteTable>> m_service_routers;
+    static const int VIRTUAL_NODES = 150; 
+
+    // 多路复用、段锁核心组件
+    std::atomic<uint64_t> m_request_id_generator{0}; 
+    static const size_t BUCKET_NUM = 16;   // 替代原来的全局锁和单表，定义 16 个桶
+    std::vector<std::unique_ptr<PromiseBucket>> m_promise_buckets;
+    
+    
     bool connect_node(ConnectionContext* ctx, const char *ip, uint16_t port);
-    std::string QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx);
     ssize_t recv_exact(int fd, char* buf, size_t size);
 
-    // 连接池核心组件
-    const int m_pool_size = 4; // 工业界通常设为 4 或 8，不宜过大
-    std::vector<std::unique_ptr<ConnectionContext>> m_conn_pool;
-    std::atomic<uint32_t> m_pool_idx{0}; // 用于 Round-Robin 轮询的计数器
+    // 动态刷新函数
+    void RefreshConnections(const std::string& method_path); // 执行路由表重建
+    static void OnNodeChange(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx); // ZK 回调函数
 
-    std::mutex m_conn_mutex; // 保护建连过程
-    std::atomic<bool> m_is_pool_inited{false}; // 标记连接池是否已完成初始化
-
-    // 多路复用核心组件
-    std::atomic<uint64_t> m_request_id_generator{0};  
-    std::mutex m_promise_mutex;                       
-    std::unordered_map<uint64_t, std::promise<std::string>> m_pending_requests; 
-    
     void ReadTask(int fd); // 后台接收线程
 };
 #endif
@@ -1300,12 +1475,12 @@ private:
 #ifndef _zookeeperutil_h_
 #define _zookeeperutil_h_
 
-#include<zookeeper/zookeeper.h>
-#include<string>
+#include <zookeeper/zookeeper.h>
+#include <string>
 #include <mutex>
 #include <condition_variable>
-#include<semaphore.h>
-
+#include <semaphore.h>
+#include <vector>
 
 //封装的zk客户端
 class ZkClient
@@ -1322,6 +1497,12 @@ public:
     //提供给 watcher 回调使用的唤醒接口
     void NotifyConnected();
 
+    // 获取指定节点下的所有子节点列表
+    std::vector<std::string> GetChildren(const char* path);
+
+    // 获取指定节点下的所有子节点列表，并注册专属监听器
+    std::vector<std::string> GetChildrenWithWatch(const char* path, watcher_fn watcher, void* watcherCtx);
+
 private:
     //Zk的客户端句柄
     zhandle_t* m_zhandle;
@@ -1331,6 +1512,7 @@ private:
     bool m_connected;               // 标记ZooKeeper客户端是否连接成功
 };
 #endif
+
 ```
 
 ---
@@ -1341,8 +1523,6 @@ private:
 #include "zookeeperutil.h"
 #include "Krpcapplication.h"
 #include "KrpcLogger.h"
-
-
 
 // 全局的watcher观察器，用于接收ZooKeeper服务器的通知
 void global_watcher(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx) {
@@ -1436,6 +1616,41 @@ std::string ZkClient::GetData(const char *path) {
         return buf;  // 返回节点数据
     }
     return "";  // 默认返回空字符串
+}
+
+std::vector<std::string> ZkClient::GetChildren(const char* path) {
+    struct String_vector strings;
+    // 调用原生的 zoo_get_children 获取所有子节点
+    int flag = zoo_get_children(m_zhandle, path, 0, &strings);
+    
+    std::vector<std::string> children;
+    if (flag == ZOK) {
+        for (int i = 0; i < strings.count; ++i) {
+            children.push_back(strings.data[i]);
+        }
+        // 释放 C 语言结构体的内存，防止内存泄漏！
+        deallocate_String_vector(&strings);
+    } else {
+        LOG(ERROR) << "zoo_get_children error, path: " << path;
+    }
+    return children;
+}
+
+std::vector<std::string> ZkClient::GetChildrenWithWatch(const char* path, watcher_fn watcher, void* watcherCtx) {
+    struct String_vector strings;
+    // 使用 zoo_wget_children 绑定我们自定义的 watcher 回调
+    int flag = zoo_wget_children(m_zhandle, path, watcher, watcherCtx, &strings);
+    
+    std::vector<std::string> children;
+    if (flag == ZOK) {
+        for (int i = 0; i < strings.count; ++i) {
+            children.push_back(strings.data[i]);
+        }
+        deallocate_String_vector(&strings); // 防止内存泄漏
+    } else {
+        LOG(ERROR) << "zoo_wget_children error, path: " << path;
+    }
+    return children;
 }
 ```
 
