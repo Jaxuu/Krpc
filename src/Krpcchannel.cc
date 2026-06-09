@@ -64,67 +64,41 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
                              ::google::protobuf::Message *response,
                              ::google::protobuf::Closure *done)
 {
-    // 1. 双检锁初始化整个连接池
+    // 1. 双检锁初始化 ZK 客户端与第一波连接
     if (!m_is_pool_inited) {  
-        std::lock_guard<std::mutex> lock(m_conn_mutex);
+        std::lock_guard<std::mutex> lock(m_init_mutex); // 专门的初始化锁
         if (!m_is_pool_inited) {
             const google::protobuf::ServiceDescriptor *sd = method->service();
             service_name = sd->name();  
             method_name = method->name();  
+            m_method_path = "/" + service_name + "/" + method_name;
 
-            ZkClient zkCli;
-            zkCli.Start();  
-            std::string method_path = "/" + service_name + "/" + method_name;
-            
-            // 拉取该方法下所有的活跃机器节点！
-            std::vector<std::string> hosts = zkCli.GetChildren(method_path.c_str());
-            if (hosts.empty()) {
-                controller->SetFailed("No active servers found for " + method_path);
-                return;
-            }
+            m_zkCli.Start(); // 启动持久化的 ZK 客户端
+            RefreshConnections(); // 首次拉取并挂载监听器
 
-            // 为发现的每一台机器，都建立 4 条多路复用连接，全部压平到 m_conn_pool 中
-            for (const auto& host : hosts) {
-                int idx = host.find(":");
-                if (idx != -1) {
-                    std::string node_ip = host.substr(0, idx);
-                    uint16_t node_port = atoi(host.substr(idx + 1).c_str());
-                    
-                    LOG(INFO) << "Discovered Node: " << node_ip << ":" << node_port;
-
-                    for (int i = 0; i < 4; ++i) { // 每台机器 4 条连接
-                        auto ctx = std::unique_ptr<ConnectionContext>(new ConnectionContext());
-                        ctx->ip = node_ip;
-                        ctx->port = node_port;
-                        if (connect_node(ctx.get(), node_ip.c_str(), node_port)) {
-                            m_conn_pool.push_back(std::move(ctx));
-                        } else {
-                            LOG(ERROR) << "Failed to connect " << node_ip << ":" << node_port;
-                        }
-                    }
-                }
-            }
-
-            m_pool_size = m_conn_pool.size(); // 动态计算池子总大小 (例如 3台机器 * 4 = 12)
-            if (m_pool_size == 0) {
-                controller->SetFailed("All connections to cluster failed");
-                return;
-            }
-            m_is_pool_inited = true; // 标记池初始化完成
+            m_is_pool_inited = true; 
         }
     }
 
-    // 2. 轮询（Round-Robin）选择一条连接
-    uint32_t idx = m_pool_idx.fetch_add(1) % m_pool_size;
-    ConnectionContext* ctx = m_conn_pool[idx].get();
+    // 2. 获取一条连接（使用 shared_ptr 拷贝，保护生命周期）
+    std::shared_ptr<ConnectionContext> ctx;
+    {
+        std::lock_guard<std::mutex> lock(m_route_mutex);
+        if (m_pool_size == 0) {
+            controller->SetFailed("Fatal Error: Cluster is down. No active servers!");
+            return;
+        }
+        //轮询
+        uint32_t idx = m_pool_idx.fetch_add(1) % m_pool_size;
+        ctx = m_conn_pool[idx]; // 即使后台 Refresh 删了池子，这根 shared_ptr 也能保住当前 ctx 不死！
+    }
 
-    // 容错机制：如果选中的连接断开了，尝试重连
+    // 断线重连兜底
     if (!ctx->is_connected) {
         std::lock_guard<std::mutex> lock(ctx->send_mutex);
         if (!ctx->is_connected) {
-            // 【注意这里】：使用当前连接专属的 ip 和 port 重连
-            if (!connect_node(ctx, ctx->ip.c_str(), ctx->port)) {
-                controller->SetFailed("selected connection is offline and reconnect failed");
+            if (!connect_node(ctx.get(), ctx->ip.c_str(), ctx->port)) {
+                controller->SetFailed("Selected connection is offline");
                 return;
             }
         }
@@ -174,7 +148,8 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     // 5. 发送数据：使用专属连接的 send_mutex 和 fd！并发度大幅提升
     {
         std::lock_guard<std::mutex> lock(ctx->send_mutex);
-        if (-1 == send(ctx->fd, send_rpc_str.c_str(), send_rpc_str.size(), 0)) {
+        // 关键修改:将最后一个参数 0 改为 MSG_NOSIGNAL
+        if (-1 == send(ctx->fd, send_rpc_str.c_str(), send_rpc_str.size(), MSG_NOSIGNAL)) {
             close(ctx->fd);
             ctx->fd = -1;
             ctx->is_connected = false; // 标记断开，下次用到会重连
@@ -230,17 +205,52 @@ bool KrpcChannel::connect_node(ConnectionContext* ctx, const char *ip, uint16_t 
     return true;
 }
 
-// 构造函数
-KrpcChannel::KrpcChannel(bool connectNow) : m_idx(0) {
-    // 啥都不用写，全靠 CallMethod 里的双检锁进行懒加载和集群发现！
-}
-
-// 析构函数：安全释放连接池中的所有 fd
-KrpcChannel::~KrpcChannel() {
-    for (auto& ctx : m_conn_pool) {
-        if (ctx->fd >= 0) {
-            close(ctx->fd);
-            ctx->fd = -1;
-        }
+// 当 ZooKeeper 发现服务器宕机或新上线时，会自动触发这个回调
+void KrpcChannel::OnNodeChange(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx) {
+    if (type == ZOO_CHILD_EVENT) { // 如果是子节点（IP目录）发生变动
+        KrpcChannel* channel = static_cast<KrpcChannel*>(watcherCtx);
+        LOG(WARNING) << "🚨 [容灾警报] ZooKeeper 探测到节点上下线，触发动态路由表重建: " << path;
+        channel->RefreshConnections(); // 重新拉取并建立连接池
     }
 }
+
+// 核心的“无锁化”路由表热替换逻辑
+void KrpcChannel::RefreshConnections() {
+    // 1. 获取最新存活的机器列表，并且重新挂载 Watcher，因为 ZK 的 Watcher 是一次性的！
+    std::vector<std::string> hosts = m_zkCli.GetChildrenWithWatch(m_method_path.c_str(), &KrpcChannel::OnNodeChange, this);
+
+    std::vector<std::shared_ptr<ConnectionContext>> new_pool;
+
+    for (const auto& host : hosts) {
+        int idx = host.find(":");
+        if (idx != -1) {
+            std::string node_ip = host.substr(0, idx);
+            uint16_t node_port = atoi(host.substr(idx + 1).c_str());
+            
+            // 为每台存活的机器建立 4 条新连接
+            for (int i = 0; i < 4; ++i) { 
+                auto ctx = std::make_shared<ConnectionContext>();
+                ctx->ip = node_ip;
+                ctx->port = node_port;
+                if (connect_node(ctx.get(), node_ip.c_str(), node_port)) {
+                    new_pool.push_back(ctx);
+                }
+            }
+        }
+    }
+
+    // 2. 瞬间热替换全局路由表！
+    {
+        std::lock_guard<std::mutex> lock(m_route_mutex);
+        m_conn_pool = new_pool; 
+        m_pool_size = m_conn_pool.size();
+        // 当 m_conn_pool 被覆盖的瞬间，旧的 shared_ptr 会被释放。
+        // 如果某个业务线程还在用旧连接，旧连接会等那个线程用完才销毁，彻底杜绝段错误！
+    }
+
+    LOG(INFO) << "✅ 路由表重建完成！当前活跃连接数: " << m_pool_size;
+}
+
+KrpcChannel::KrpcChannel(bool connectNow) {}
+
+KrpcChannel::~KrpcChannel() {}

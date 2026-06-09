@@ -113,3 +113,20 @@ std::vector<std::string> ZkClient::GetChildren(const char* path) {
     }
     return children;
 }
+
+std::vector<std::string> ZkClient::GetChildrenWithWatch(const char* path, watcher_fn watcher, void* watcherCtx) {
+    struct String_vector strings;
+    // 使用 zoo_wget_children 绑定我们自定义的 watcher 回调
+    int flag = zoo_wget_children(m_zhandle, path, watcher, watcherCtx, &strings);
+    
+    std::vector<std::string> children;
+    if (flag == ZOK) {
+        for (int i = 0; i < strings.count; ++i) {
+            children.push_back(strings.data[i]);
+        }
+        deallocate_String_vector(&strings); // 防止内存泄漏
+    } else {
+        LOG(ERROR) << "zoo_wget_children error, path: " << path;
+    }
+    return children;
+}

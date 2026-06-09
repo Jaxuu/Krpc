@@ -10,19 +10,25 @@
 #include <vector>
 #include <memory>
 #include <sys/types.h> // 提供 ssize_t 定义
+#include "zookeeperutil.h"
 
 // 每条TCP连接的独立上下文
 struct ConnectionContext {
     int fd = -1;
     std::mutex send_mutex; // 每条连接专属的发送锁！
-    std::thread read_thread;
     std::atomic<bool> is_connected{false}; // 标记当前连接是否存活
-    // 新增：记录当前这个连接到底连的是谁
+    // 记录当前这个连接到底连的是谁
     std::string ip;
     uint16_t port = 0;
+    // 利用 RAII 机制，当这个上下文被销毁时，自动切断底层的网线
+    ~ConnectionContext() {
+        if (fd >= 0) {
+            close(fd); 
+            // 只要这里 close 了 fd，后台正在阻塞 recv 的 ReadTask 就会瞬间收到 0，退出循环并安全结束线程！
+            fd = -1;
+        }
+    }
 };
-
-class ZkClient;
 
 class KrpcChannel : public google::protobuf::RpcChannel
 {
@@ -34,23 +40,28 @@ public:
                     const ::google::protobuf::Message *request,
                     ::google::protobuf::Message *response,
                     ::google::protobuf::Closure *done) override; // override可以验证是否是虚函数
+                    
 private:
     std::string service_name;
-    std::string m_ip;
-    uint16_t m_port;
     std::string method_name;
-    int m_idx; // 用来划分服务器ip和port的下标
 
     bool connect_node(ConnectionContext* ctx, const char *ip, uint16_t port);
-    std::string QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx);
     ssize_t recv_exact(int fd, char* buf, size_t size);
+
+    // 动态刷新函数
+    void RefreshConnections(); // 执行路由表重建
+    static void OnNodeChange(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx); // ZK 回调函数
+
+    // --- 集群容灾核心组件 ---
+    ZkClient m_zkCli;                   // 持久化 ZK 客户端，保持与注册中心的 Session
+    std::string m_method_path;          // 需要持续监听的服务路径
+    std::mutex m_route_mutex;           // 保护路由表，防止读写冲突
+    std::mutex m_init_mutex;            // 专门保护双检锁初始化的锁！
 
     // 连接池核心组件
     size_t m_pool_size = 0; //线程池大小，改为运行时动态计算
-    std::vector<std::unique_ptr<ConnectionContext>> m_conn_pool;
+    std::vector<std::shared_ptr<ConnectionContext>> m_conn_pool;    // 改为 shared_ptr。确保正在发送请求的线程拿到副本后，即使后台清空了旧池子，旧连接也能安全存活到发包结束！
     std::atomic<uint32_t> m_pool_idx{0}; // 用于 Round-Robin 轮询的计数器
-
-    std::mutex m_conn_mutex; // 保护建连过程
     std::atomic<bool> m_is_pool_inited{false}; // 标记连接池是否已完成初始化
 
     // 多路复用核心组件

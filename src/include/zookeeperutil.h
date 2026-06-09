@@ -26,6 +26,9 @@ public:
     // 获取指定节点下的所有子节点列表
     std::vector<std::string> GetChildren(const char* path);
 
+    // 获取指定节点下的所有子节点列表，并注册专属监听器
+    std::vector<std::string> GetChildrenWithWatch(const char* path, watcher_fn watcher, void* watcherCtx);
+
 private:
     //Zk的客户端句柄
     zhandle_t* m_zhandle;
