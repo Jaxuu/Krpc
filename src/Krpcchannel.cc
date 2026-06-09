@@ -33,11 +33,19 @@ void KrpcChannel::ReadTask(int fd) {
         std::string response_str(body_buf.data(), body_len);
 
         uint64_t req_id = krpcheader.request_id();
-        std::lock_guard<std::mutex> lock(m_promise_mutex);
-        auto it = m_pending_requests.find(req_id);
-        if (it != m_pending_requests.end()) {
-            it->second.set_value(response_str); 
-            m_pending_requests.erase(it);       
+
+        // 同样通过 req_id 取模，找到这个请求对应的桶
+        size_t bucket_index = req_id % BUCKET_NUM;
+        auto& bucket = m_promise_buckets[bucket_index];
+
+        {
+            // 只锁住这个特定的桶，绝不会阻塞正在写入其他桶的线程！
+            std::lock_guard<std::mutex> lock(bucket->mutex);
+            auto it = bucket->pending_requests.find(req_id);
+            if (it != bucket->pending_requests.end()) {
+                it->second.set_value(response_str); 
+                bucket->pending_requests.erase(it);       
+            }
         }
     }
 }
@@ -140,9 +148,14 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     // 4. 在全局表中注册 promise
     std::promise<std::string> prom;
     std::future<std::string> fut = prom.get_future();
+
+    // 通过 request_id 取模，计算这个请求该去哪个桶排队
+    size_t bucket_index = current_id % BUCKET_NUM;
+    auto& bucket = m_promise_buckets[bucket_index];
     {
-        std::lock_guard<std::mutex> lock(m_promise_mutex);
-        m_pending_requests[current_id] = std::move(prom);
+        // 只锁这 1/16 的区域！
+        std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+        bucket->pending_requests[current_id] = std::move(prom);
     }
 
     // 5. 发送数据：使用专属连接的 send_mutex 和 fd！并发度大幅提升
@@ -154,8 +167,9 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
             ctx->fd = -1;
             ctx->is_connected = false; // 标记断开，下次用到会重连
             controller->SetFailed("send error");
-            std::lock_guard<std::mutex> plock(m_promise_mutex);
-            m_pending_requests.erase(current_id);
+
+            std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+            bucket->pending_requests.erase(current_id);
             return;
         }
     }
@@ -163,8 +177,8 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     // 6. 等待各自专属的 ReadTask 唤醒
     if (fut.wait_for(std::chrono::seconds(3)) == std::future_status::timeout) {
         controller->SetFailed("rpc call timeout");
-        std::lock_guard<std::mutex> lock(m_promise_mutex);
-        m_pending_requests.erase(current_id);
+        std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+        bucket->pending_requests.erase(current_id);
         return;
     }
 
@@ -251,6 +265,10 @@ void KrpcChannel::RefreshConnections() {
     LOG(INFO) << "✅ 路由表重建完成！当前活跃连接数: " << m_pool_size;
 }
 
-KrpcChannel::KrpcChannel(bool connectNow) {}
+KrpcChannel::KrpcChannel(bool connectNow) {// 预先分配好 16 个带有独立锁的哈希表桶
+    for (size_t i = 0; i < BUCKET_NUM; ++i) {
+        m_promise_buckets.push_back(std::unique_ptr<PromiseBucket>(new PromiseBucket()));
+    }
+}
 
 KrpcChannel::~KrpcChannel() {}

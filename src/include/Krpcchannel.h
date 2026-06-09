@@ -30,6 +30,12 @@ struct ConnectionContext {
     }
 };
 
+// 定义小哈希表（桶）结构
+struct PromiseBucket {
+        std::mutex mutex; // 这个桶专属的独立锁
+        std::unordered_map<uint64_t, std::promise<std::string>> pending_requests;
+    };
+
 class KrpcChannel : public google::protobuf::RpcChannel
 {
 public:
@@ -45,13 +51,6 @@ private:
     std::string service_name;
     std::string method_name;
 
-    bool connect_node(ConnectionContext* ctx, const char *ip, uint16_t port);
-    ssize_t recv_exact(int fd, char* buf, size_t size);
-
-    // 动态刷新函数
-    void RefreshConnections(); // 执行路由表重建
-    static void OnNodeChange(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx); // ZK 回调函数
-
     // --- 集群容灾核心组件 ---
     ZkClient m_zkCli;                   // 持久化 ZK 客户端，保持与注册中心的 Session
     std::string m_method_path;          // 需要持续监听的服务路径
@@ -64,11 +63,19 @@ private:
     std::atomic<uint32_t> m_pool_idx{0}; // 用于 Round-Robin 轮询的计数器
     std::atomic<bool> m_is_pool_inited{false}; // 标记连接池是否已完成初始化
 
-    // 多路复用核心组件
-    std::atomic<uint64_t> m_request_id_generator{0};  
-    std::mutex m_promise_mutex;                       
-    std::unordered_map<uint64_t, std::promise<std::string>> m_pending_requests; 
+    // 多路复用、段锁核心组件
+    std::atomic<uint64_t> m_request_id_generator{0}; 
+    static const size_t BUCKET_NUM = 16;   // 替代原来的全局锁和单表，定义 16 个桶
+    std::vector<std::unique_ptr<PromiseBucket>> m_promise_buckets;
     
+    
+    bool connect_node(ConnectionContext* ctx, const char *ip, uint16_t port);
+    ssize_t recv_exact(int fd, char* buf, size_t size);
+
+    // 动态刷新函数
+    void RefreshConnections(); // 执行路由表重建
+    static void OnNodeChange(zhandle_t *zh, int type, int status, const char *path, void *watcherCtx); // ZK 回调函数
+
     void ReadTask(int fd); // 后台接收线程
 };
 #endif
