@@ -9,7 +9,8 @@
 #include <atomic>
 #include <vector>
 #include <memory>
-#include <sys/types.h> // 提供 ssize_t 定义
+#include <sys/types.h>
+#include <map>
 #include "zookeeperutil.h"
 
 // 每条TCP连接的独立上下文
@@ -51,16 +52,22 @@ private:
     std::string service_name;
     std::string method_name;
 
-    // --- 集群容灾核心组件 ---
+    // 集群容灾核心组件
     ZkClient m_zkCli;                   // 持久化 ZK 客户端，保持与注册中心的 Session
     std::string m_method_path;          // 需要持续监听的服务路径
     std::mutex m_route_mutex;           // 保护路由表，防止读写冲突
     std::mutex m_init_mutex;            // 专门保护双检锁初始化的锁！
 
-    // 连接池核心组件
-    size_t m_pool_size = 0; //线程池大小，改为运行时动态计算
-    std::vector<std::shared_ptr<ConnectionContext>> m_conn_pool;    // 改为 shared_ptr。确保正在发送请求的线程拿到副本后，即使后台清空了旧池子，旧连接也能安全存活到发包结束！
-    std::atomic<uint32_t> m_pool_idx{0}; // 用于 Round-Robin 轮询的计数器
+    // 一致性哈希核心组件
+    size_t m_pool_size = 0; // 记录当前存活的物理连接数
+    
+    // 虚拟节点倍数：每个物理连接在环上映射出 150 个虚拟节点，解决数据倾斜！
+    static const int VIRTUAL_NODES = 150; 
+    
+    // 哈希环 (Hash Ring)：Key 是哈希值(环上的位置)，Value 是具体的 TCP 连接
+    // map 底层是红黑树，天然支持按照 Key 有序排列，完美模拟圆环！
+    std::map<uint32_t, std::shared_ptr<ConnectionContext>> m_hash_ring;
+
     std::atomic<bool> m_is_pool_inited{false}; // 标记连接池是否已完成初始化
 
     // 多路复用、段锁核心组件

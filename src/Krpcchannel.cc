@@ -72,6 +72,9 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
                              ::google::protobuf::Message *response,
                              ::google::protobuf::Closure *done)
 {
+    // 提早生成唯一的路由 Key！
+    uint64_t current_id = m_request_id_generator.fetch_add(1);
+
     // 1. 双检锁初始化 ZK 客户端与第一波连接
     if (!m_is_pool_inited) {  
         std::lock_guard<std::mutex> lock(m_init_mutex); // 专门的初始化锁
@@ -92,13 +95,24 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     std::shared_ptr<ConnectionContext> ctx;
     {
         std::lock_guard<std::mutex> lock(m_route_mutex);
-        if (m_pool_size == 0) {
+        if (m_hash_ring.empty()) {
             controller->SetFailed("Fatal Error: Cluster is down. No active servers!");
             return;
         }
-        //轮询
-        uint32_t idx = m_pool_idx.fetch_add(1) % m_pool_size;
-        ctx = m_conn_pool[idx]; // 即使后台 Refresh 删了池子，这根 shared_ptr 也能保住当前 ctx 不死！
+
+        // 把 request_id 转换成字符串作为路由 Key（在实际业务中，你可以让上层传递 userId）
+        std::string routing_key = std::to_string(current_id);
+        uint32_t hash_val = std::hash<std::string>{}(routing_key);
+
+        // 算法核心：在红黑树中寻找第一个 > hash_val 的节点，相当于在环上顺时针找！
+        auto it = m_hash_ring.upper_bound(hash_val);
+        
+        // 如果到了树的末尾，说明越过了 2^32，由于是环，我们回到起点
+        if (it == m_hash_ring.end()) {
+            it = m_hash_ring.begin();
+        }
+        
+        ctx = it->second;
     }
 
     // 断线重连兜底
@@ -118,8 +132,6 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
         controller->SetFailed("serialize request fail");
         return;
     }
-
-    uint64_t current_id = m_request_id_generator.fetch_add(1);
 
     Krpc::RpcHeader krpcheader;
     krpcheader.set_service_name(service_name);
@@ -233,8 +245,12 @@ void KrpcChannel::RefreshConnections() {
     // 1. 获取最新存活的机器列表，并且重新挂载 Watcher，因为 ZK 的 Watcher 是一次性的！
     std::vector<std::string> hosts = m_zkCli.GetChildrenWithWatch(m_method_path.c_str(), &KrpcChannel::OnNodeChange, this);
 
-    std::vector<std::shared_ptr<ConnectionContext>> new_pool;
+    // 构建一个崭新的哈希环
+    std::map<uint32_t, std::shared_ptr<ConnectionContext>> new_hash_ring;
+    std::hash<std::string> hash_fn; // C++11 标准字符串哈希函数
 
+    size_t active_physical_connections = 0;
+    
     for (const auto& host : hosts) {
         int idx = host.find(":");
         if (idx != -1) {
@@ -247,22 +263,35 @@ void KrpcChannel::RefreshConnections() {
                 ctx->ip = node_ip;
                 ctx->port = node_port;
                 if (connect_node(ctx.get(), node_ip.c_str(), node_port)) {
-                    new_pool.push_back(ctx);
+                    active_physical_connections++;
+
+                    // 为这一条物理连接，生成 150 个虚拟节点挂到环上！
+                    for (int v = 0; v < VIRTUAL_NODES; ++v) {
+                        // 构造虚拟节点的名字，例如: "127.0.0.1:8000_conn0_VN45"
+                        std::string vnode_name = node_ip + ":" + std::to_string(node_port) 
+                                                 + "_conn" + std::to_string(i) 
+                                                 + "_VN" + std::to_string(v);
+                        
+                        // 计算它在环上的位置 0 ~ 2^32
+                        uint32_t hash_val = hash_fn(vnode_name);
+                        
+                        // 将虚拟节点放入红黑树中，指向真实的 ctx
+                        new_hash_ring[hash_val] = ctx; 
+                    }
                 }
             }
         }
     }
 
-    // 2. 瞬间热替换全局路由表！
+    // 2. 瞬间热替换全局哈希环！
     {
         std::lock_guard<std::mutex> lock(m_route_mutex);
-        m_conn_pool = new_pool; 
-        m_pool_size = m_conn_pool.size();
-        // 当 m_conn_pool 被覆盖的瞬间，旧的 shared_ptr 会被释放。
-        // 如果某个业务线程还在用旧连接，旧连接会等那个线程用完才销毁，彻底杜绝段错误！
+        m_hash_ring = new_hash_ring; 
+        m_pool_size = active_physical_connections;
     }
 
-    LOG(INFO) << "✅ 路由表重建完成！当前活跃连接数: " << m_pool_size;
+    LOG(INFO) << "✅ 路由表重建完成！当前活跃物理连接: " << m_pool_size 
+              << "，哈希环虚拟节点总数: " << new_hash_ring.size();
 }
 
 KrpcChannel::KrpcChannel(bool connectNow) {// 预先分配好 16 个带有独立锁的哈希表桶
